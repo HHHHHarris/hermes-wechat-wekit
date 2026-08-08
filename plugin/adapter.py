@@ -34,12 +34,13 @@ import asyncio
 import contextlib
 import datetime
 import hashlib
-import html
 import logging
 import os
 import re
 import shlex
+import struct
 import time
+import zlib
 from typing import Any
 from xml.etree import ElementTree
 
@@ -484,130 +485,108 @@ class PhoneMediaFetcher:
     # ── official-account articles ─────────────────────────────────────────
     #
     # An article URL cannot be fetched from anywhere but a real WeChat client:
-    # mp.weixin.qq.com redirects everything else to a captcha ("环境异常").
-    # It also cannot be read out of the app programmatically — the article
-    # renders in WeChat's separate :tools process, which WeKit's WebView
-    # tracking does not reach, and its text never enters the accessibility
-    # tree, so a UI dump comes back empty.
+    # mp.weixin.qq.com redirects everything else to a captcha ("环境异常"). The
+    # article renders in WeChat's separate :tools process in the *system*
+    # Chromium WebView. Two paths get its content off the phone, in order of
+    # preference:
     #
-    # What does work is the screen. The article renders normally and is not
-    # FLAG_SECURE, so it can be opened on the phone, scrolled, and captured —
-    # and the agent reads the resulting images the same way it reads any other
-    # picture. Slower and less exact than HTML, but it is the one path that
-    # actually produces the content.
+    #   read_article()    — open it, then read the rendered HTML straight out of
+    #                       that WebView's on-disk HTTP cache (Chromium Simple
+    #                       Cache). Clean structured text in one shot, no screen
+    #                       capture, and nothing on the device is modified — the
+    #                       cache files are only read. Depends on the document
+    #                       being cacheable (most articles are; a `no-store`
+    #                       response would not be).
+    #   capture_article() — fallback when the document is not in the cache: open
+    #                       it, scroll, and screenshot each screen for the agent
+    #                       to read with vision.
+    #
+    # (An accessibility-tree read was measured too — it works, but yields noisier,
+    # scroll-dependent text and has to toggle system accessibility settings, so
+    # the cache path supersedes it.)
 
     ARTICLE_HOSTS = ("mp.weixin.qq.com",)
     _ARTICLE_ACTIVITY = "com.tencent.mm/.plugin.webview.ui.tools.WebViewUI"
-
-    # Chromium only builds an Android accessibility tree for its WebView while
-    # an accessibility service is running; without one, a UI dump of an open
-    # article is a single empty node. Select-to-Speak is used because it is
-    # preinstalled on stock Android, and unlike TalkBack it neither speaks nor
-    # takes over touch exploration while merely enabled.
-    _A11Y_SERVICE = ("com.google.android.marvin.talkback/"
-                     "com.google.android.accessibility.selecttospeak."
-                     "SelectToSpeakService")
-
-    # Trailing junk: WeChat appends ad slots and navigation after the article.
-    _ARTICLE_STOP_MARKERS = ("广告", "上一篇", "下一篇", "轻点两下取消赞",
-                             "写留言", "暂无留言")
-    _ARTICLE_DROP = re.compile(
-        r"^(Follow|muted_icon|arrow_\w+|了解更多|立即咨询|点击了解更多|"
-        r"[0-9a-f]{24,}.*|听全文|Original|轻触阅读原文)$")
+    # The :tools WebView's HTTP cache. The space in "Profile 1" and "HTTP Cache"
+    # is real — every use must quote the whole path.
+    _TOOLS_CACHE = ("/data/data/com.tencent.mm/cache/webview_com_tencent_mm_tools/"
+                    "Profile 1/HTTP Cache/Cache_Data")
 
     @classmethod
     def is_article(cls, url: str) -> bool:
         return bool(url) and any(h in url for h in cls.ARTICLE_HOSTS)
 
-    async def _set_accessibility(self, on: bool) -> None:
-        """Toggle the accessibility service the WebView tree depends on."""
-        if on:
-            await self._su("settings put secure enabled_accessibility_services "
-                           f"{self._A11Y_SERVICE}")
-            await self._su("settings put secure accessibility_enabled 1")
-        else:
-            await self._su("settings delete secure enabled_accessibility_services")
-            await self._su("settings put secure accessibility_enabled 0")
+    async def read_article(self, url: str) -> tuple[str, str]:
+        """Open an article and recover its text from the WebView disk cache.
 
-    async def _dump_text(self) -> list[str]:
-        """Visible text of the current screen, via the accessibility tree."""
-        remote = "/sdcard/wekit-uidump.xml"
-        rc, _ = await self._adb("shell", f"uiautomator dump {remote}", timeout=60)
-        if rc != 0:
-            return []
-        rc, xml = await self._adb("shell", f"cat {remote}", timeout=40)
-        if rc != 0 or not xml:
-            return []
-        out = []
-        for raw in re.findall(rb'text="([^"]{2,})"', xml):
-            t = html.unescape(raw.decode("utf-8", "replace")).strip()
-            if t:
-                out.append(t)
-        return out
-
-    async def read_article(self, url: str, max_pages: int = 25) -> str:
-        """Open an article on the phone and return its text.
-
-        The article cannot be fetched from off-device — WeChat serves it only to
-        its own client — and its WebView lives in a process WeKit's tooling does
-        not reach. But it is the *system* Chromium WebView, which does expose an
-        accessibility tree, so with an accessibility service running the text can
-        simply be read off the screen as it is scrolled.
+        Returns (title, body_text); ("", "") if the document was not cached.
+        Reads only — nothing on the device is changed.
         """
-        collected: list[str] = []
-        seen: set[str] = set()
-        # Note what was there first so the phone is left exactly as found.
-        # `settings get` prints the literal string "null" when unset, which is
-        # truthy — comparing against it explicitly is what makes the restore
-        # correct rather than leaving the service switched on.
-        prior = (await self._su(
-            "settings get secure enabled_accessibility_services")).strip()
-        had_service = prior not in ("", "null")
+        marker = f"/sdcard/wekit-artmark-{int(time.time() * 1000)}"
+        staged = f"/sdcard/wekit-artcache-{int(time.time() * 1000)}"
         try:
-            if not had_service:
-                await self._set_accessibility(True)
-                await asyncio.sleep(2.0)
-
             await self._su("input keyevent KEYCODE_WAKEUP")
             await self._su("wm dismiss-keyguard")
-            # Load after enabling the service: an already-rendered page has no
-            # accessibility tree and will not grow one.
+            # Timestamp reference: only cache entries written after this — i.e.
+            # for the article we are about to open — are copied out.
+            await self._su(f"touch {marker}")
             await self._su(f"am start -n {self._ARTICLE_ACTIVITY} "
                            f"-e rawUrl {shlex.quote(url)}")
-            await asyncio.sleep(8.0)
+            await asyncio.sleep(9.0)   # let the page load and the cache write
 
-            stalled = 0
-            for _ in range(max_pages):
-                fresh = [t for t in await self._dump_text() if t not in seen]
-                for t in fresh:
-                    seen.add(t)
-                    collected.append(t)
-                # Two scrolls that reveal nothing new means the end.
-                stalled = stalled + 1 if not fresh else 0
-                if stalled >= 2:
-                    break
-                await self._su("input swipe 500 1650 500 500 350")
-                await asyncio.sleep(1.2)
+            # Copy the freshly-written document entries (large; assets are small)
+            # out to a pullable location. find -newer avoids sweeping the whole
+            # cache; -size filters out the many small asset entries.
+            cq = shlex.quote(self._TOOLS_CACHE)
+            await self._su(f"mkdir -p {staged}")
+            await self._su(
+                f"find {cq} -type f -name '*_0' -newer {marker} -size +80k "
+                f"-exec cp {{}} {staged}/ \\;")
+
+            local_dir = os.path.join(self.dest_dir, f"artcache_{int(time.time() * 1000)}")
+            os.makedirs(local_dir, exist_ok=True)
+            rc, _ = await self._adb("pull", staged, local_dir)
+            if rc != 0:
+                return "", ""
+
+            title, text = await asyncio.to_thread(self._extract_from_cache_dir, local_dir)
+            with contextlib.suppress(OSError):
+                for f in os.listdir(local_dir):
+                    os.remove(os.path.join(local_dir, f))
+                os.rmdir(local_dir)
+            return title, text
         except Exception:
-            logger.debug("wechat-wekit: article read failed", exc_info=True)
+            logger.debug("wechat-wekit: article cache read failed", exc_info=True)
+            return "", ""
         finally:
             with contextlib.suppress(Exception):
+                await self._su(f"rm -rf {marker} {staged}")
                 await self._su("input keyevent KEYCODE_HOME")
-                if not had_service:
-                    await self._set_accessibility(False)
-        return self._clean_article(collected)
 
-    @classmethod
-    def _clean_article(cls, lines: list[str]) -> str:
-        """Drop WeChat's chrome and the ad block that follows the article."""
-        kept = []
-        for t in lines:
-            if any(m in t for m in cls._ARTICLE_STOP_MARKERS):
-                break
-            if cls._ARTICLE_DROP.match(t):
-                continue
-            kept.append(t)
-        return "\n".join(kept).strip()
+    @staticmethod
+    def _extract_from_cache_dir(local_dir: str) -> tuple[str, str]:
+        """Parse pulled Simple Cache entries; return the best article text."""
+        best = ("", "")
+        for root, _dirs, files in os.walk(local_dir):
+            for fn in files:
+                path = os.path.join(root, fn)
+                try:
+                    raw = _read_bytes(path)
+                except OSError:
+                    continue
+                entry = _simple_cache_entry(raw)
+                if not entry:
+                    continue
+                key, body = entry
+                if "mp.weixin.qq.com/s" not in key:
+                    continue
+                dec = _decompress_body(body)
+                if b"js_content" not in dec and b"rich_media" not in dec:
+                    continue
+                title, text = _article_text_from_html(dec)
+                if len(text) > len(best[1]):
+                    best = (title, text)
+        return best
 
     async def capture_article(self, url: str, max_pages: int = 12) -> list[str]:
         """Open an article on the phone and return screenshots of it.
@@ -727,6 +706,89 @@ def _write_bytes(path: str, data: bytes) -> None:
     """Blocking file write, run in a worker thread."""
     with open(path, "wb") as f:
         f.write(data)
+
+
+# ── Chromium "Simple Cache" parsing (for reading official-account articles) ──
+#
+# A WeChat article can only be fetched inside a real WeChat client, but once it
+# has rendered, its HTML sits in that WebView's on-disk HTTP cache in Chromium's
+# Simple Cache format. Reading it there needs no injection into WeChat and no
+# screen capture — just the cache files, which root can copy out.
+
+_SIMPLE_CACHE_MAGIC = 0xFCFB6D1BA7725C30
+
+
+def _simple_cache_entry(raw: bytes):
+    """Parse one Simple Cache '<hash>_0' file → (key_url, body_bytes) or None."""
+    if len(raw) < 24 or struct.unpack_from("<Q", raw, 0)[0] != _SIMPLE_CACHE_MAGIC:
+        return None
+    _version, key_len, _key_hash = struct.unpack_from("<III", raw, 8)
+    if key_len <= 0 or 24 + key_len > len(raw):
+        return None
+    key = raw[24:24 + key_len].decode("utf-8", "replace")
+    return key, raw[24 + key_len:]
+
+
+def _decompress_body(body: bytes) -> bytes:
+    """Decompress a cached HTTP body. gzip/deflate always; brotli if available.
+
+    The body has Simple Cache EOF records appended, so a strict one-shot
+    decompress raises on the trailing bytes — a streaming decompressor that
+    stops at the gzip stream's end is required.
+    """
+    gz = body.find(b"\x1f\x8b")
+    if gz >= 0:
+        try:
+            d = zlib.decompressobj(16 + zlib.MAX_WBITS)
+            out = d.decompress(body[gz:]) + d.flush()
+            if len(out) > 500:
+                return out
+        except zlib.error:
+            pass
+    try:
+        import brotli
+        for start in range(0, min(len(body), 200)):
+            try:
+                out = brotli.decompress(body[start:])
+                if len(out) > 500:
+                    return out
+            except Exception:
+                continue
+    except ImportError:
+        pass
+    for start in range(0, 6):
+        try:
+            out = zlib.decompress(body[start:], -zlib.MAX_WBITS)
+            if len(out) > 500:
+                return out
+        except zlib.error:
+            continue
+    return body
+
+
+def _article_text_from_html(dec: bytes) -> tuple[str, str]:
+    """Extract (title, body_text) from a WeChat article HTML document."""
+    tm = (re.search(rb'property="og:title"\s+content="(.*?)"', dec)
+          or re.search(rb'<title>(.*?)</title>', dec, re.S))
+    title = html_unescape(_strip_tags(tm.group(1))) if tm else ""
+
+    m = re.search(rb'id="js_content"[^>]*>(.*?)</div>\s*</div>', dec, re.S)
+    region = m.group(1) if m else dec
+    region = re.sub(rb'<script.*?</script>', b'', region, flags=re.S)
+    region = re.sub(rb'<style.*?</style>', b'', region, flags=re.S)
+    text = html_unescape(_strip_tags(region, sep=b"\n"))
+    text = re.sub(r'\n[ \t]*\n+', '\n', text)
+    text = re.sub(r'[ \t]+', ' ', text).strip()
+    return title.strip(), text
+
+
+def _strip_tags(b: bytes, sep: bytes = b"") -> str:
+    return re.sub(rb'<[^>]+>', sep, b).decode("utf-8", "replace")
+
+
+def html_unescape(s: str) -> str:
+    import html as _html
+    return _html.unescape(s)
 
 
 class WeKitAdapter(BasePlatformAdapter):
@@ -943,11 +1005,12 @@ class WeKitAdapter(BasePlatformAdapter):
         elif self._media and self._capture_articles and \
                 self._media.is_article(meta.get("url", "")):
             # The agent cannot fetch this link itself — WeChat serves articles
-            # only to its own client. Read it off the phone instead: text if the
-            # accessibility tree gives it up, screenshots as a fallback.
-            body = await self._media.read_article(meta["url"])
+            # only to its own client. Read it off the phone instead: clean text
+            # from the WebView disk cache first, screenshots as a fallback.
+            title, body = await self._media.read_article(meta["url"])
             if body:
-                text += f"\n\n--- article text (read on the phone) ---\n{body}"
+                head = f"# {title}\n\n" if title else ""
+                text += f"\n\n--- article text (read on the phone) ---\n{head}{body}"
                 logger.info("wechat-wekit: read article text (%d chars)", len(body))
             else:
                 shots = await self._media.capture_article(meta["url"])

@@ -306,3 +306,62 @@ def test_oversized_payload_is_refused_rather_than_parsed():
 def test_malformed_xml_does_not_raise():
     text, _, _ = describe_payload(3, "<msg><img aeskey='x' UNCLOSED")
     assert isinstance(text, str) and text
+
+
+# ── Chromium Simple Cache parsing (official-account articles) ────────────
+
+import gzip as _gzip  # noqa: E402
+import struct as _struct  # noqa: E402
+
+from plugin.adapter import (  # noqa: E402
+    _article_text_from_html,
+    _decompress_body,
+    _simple_cache_entry,
+)
+
+
+def _make_cache_entry(url: str, body: bytes) -> bytes:
+    """Build a minimal Simple Cache '_0' file: header + key + body."""
+    key = url.encode()
+    # Real SimpleFileHeader is 24 bytes: magic(8)+version(4)+key_len(4)+hash(4)
+    # padded to 8-byte alignment; the key starts at offset 24.
+    header = _struct.pack("<QIII", 0xFCFB6D1BA7725C30, 8, len(key), 0) + b"\x00\x00\x00\x00"
+    return header + key + body
+
+
+def test_parses_a_simple_cache_entry_key_and_body():
+    raw = _make_cache_entry("1/0/https://mp.weixin.qq.com/s?__biz=X", b"PAYLOAD")
+    key, body = _simple_cache_entry(raw)
+    assert "mp.weixin.qq.com/s" in key
+    assert body == b"PAYLOAD"
+
+
+def test_rejects_a_file_without_the_magic():
+    assert _simple_cache_entry(b"not a cache file at all, padded out......") is None
+
+
+def test_decompresses_gzip_with_trailing_cache_junk():
+    # Simple Cache appends EOF records after the gzip stream; a strict one-shot
+    # decompress would choke on them.
+    html = b"<html><body>hello world " + b"x" * 800 + b"</body></html>"
+    blob = _gzip.compress(html) + b"\x00\x01\x02trailing-eof-records"
+    assert _decompress_body(blob) == html
+
+
+def test_extracts_title_and_body_from_article_html():
+    doc = (b'<html><head><meta property="og:title" content="Test Title">'
+           b'</head><body><div id="js_content">'
+           b'<p>First paragraph.</p><p>Second paragraph.</p>'
+           b'</div></div></body></html>')
+    title, text = _article_text_from_html(doc)
+    assert title == "Test Title"
+    assert "First paragraph." in text
+    assert "Second paragraph." in text
+    assert "<p>" not in text and "js_content" not in text
+
+
+def test_article_extraction_unescapes_entities():
+    doc = (b'<html><body><div id="js_content">'
+           b'<p>A &amp; B &lt;tag&gt;</p></div></div></body></html>')
+    _title, text = _article_text_from_html(doc)
+    assert "A & B <tag>" in text
