@@ -35,6 +35,7 @@ full control of the WeChat account to everything on the network, guarded only by
 a bearer token sent in cleartext. Widen it only deliberately.
 """
 
+import contextlib
 import os
 import socket
 import subprocess
@@ -86,10 +87,8 @@ def pipe(a: socket.socket, b: socket.socket) -> None:
         pass
     finally:
         for s in (a, b):
-            try:
+            with contextlib.suppress(OSError):
                 s.close()
-            except OSError:
-                pass
 
 
 def main() -> None:
@@ -111,10 +110,8 @@ def main() -> None:
             upstream.connect(TARGET)
             upstream.settimeout(None)
         except OSError:
-            try:
+            with contextlib.suppress(OSError):
                 client.close()
-            except OSError:
-                pass
             continue
         threading.Thread(target=pipe, args=(client, upstream), daemon=True).start()
         threading.Thread(target=pipe, args=(upstream, client), daemon=True).start()

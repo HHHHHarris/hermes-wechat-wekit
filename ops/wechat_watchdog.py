@@ -94,7 +94,7 @@ def adb_cmd(*args: str, timeout: int = 25):
     cmd += list(args)
     try:
         return subprocess.run(cmd, timeout=timeout, capture_output=True, text=True)
-    except Exception as e:  # noqa: BLE001 - adb failures must never kill the loop
+    except Exception as e:  # adb failures must never kill the loop
         log(f"adb error {e!r} running {args}")
 
         class _Failed:
@@ -140,7 +140,7 @@ def main() -> int:
                 if fails >= FAILS_BEFORE_ADB:
                     revive()
                     fails = 0
-        except Exception as e:  # noqa: BLE001 - the watchdog must never die
+        except Exception as e:  # the watchdog must never die
             log(f"loop error {e!r}")
         time.sleep(INTERVAL)
 

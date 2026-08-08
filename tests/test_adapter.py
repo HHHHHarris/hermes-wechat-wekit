@@ -10,7 +10,6 @@ import pytest
 
 from plugin import adapter as wk
 
-
 # ── parsing the wait-for-new-message payload ─────────────────────────────
 #
 # This is the most fragile surface in the adapter: WeKit returns the message as

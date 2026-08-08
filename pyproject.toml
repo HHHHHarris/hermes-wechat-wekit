@@ -18,6 +18,35 @@ Issues = "https://github.com/HHHHHarris/hermes-wechat-wekit/issues"
 line-length = 100
 target-version = "py310"
 
+# The rule set is pinned explicitly rather than inherited from whatever ruff
+# happens to default to. Defaults widen between releases, and an unpinned set
+# means CI starts failing on untouched code the day the runner picks up a new
+# ruff — which is exactly what happened here.
+[tool.ruff.lint]
+select = [
+    "E", "W",    # pycodestyle
+    "F",         # pyflakes
+    "I",         # import sorting
+    "UP",        # pyupgrade
+    "B",         # bugbear
+    "SIM",       # simplify
+    "ASYNC",     # blocking calls inside async — this codebase shares one event
+                 # loop between the inbound poll and dispatch, so a blocking call
+                 # stalls the poll, and a stalled poll drops messages
+    "RUF",
+]
+# Deliberately not selected, with reasons:
+#   BLE001  blind except — the poll loop, the watchdog and the bridge must
+#           survive anything the network or adb throws at them; dying is the
+#           worse failure. Each one is commented at the call site.
+#   DTZ     naive datetimes — local time is what you want in an operator log.
+#   PLW1510 subprocess without check= — these call sites inspect returncode.
+#   S110    try/except/pass — used only in socket/adb teardown paths.
+
+[tool.ruff.lint.per-file-ignores]
+# Tests favour readability over strictness.
+"tests/*" = ["E501"]
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]

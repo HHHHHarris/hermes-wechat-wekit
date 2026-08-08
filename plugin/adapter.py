@@ -31,22 +31,22 @@ Inbound:  MCP   tools/call wait-for-new-message  (long-poll, DB-insert hook).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import datetime
 import logging
 import os
 import re
 import time
-from typing import Any, Dict, Optional
+from typing import Any
 
 import httpx
-
+from gateway.config import Platform
 from gateway.platforms.base import (
     BasePlatformAdapter,
-    SendResult,
     MessageEvent,
     MessageType,
+    SendResult,
 )
-from gateway.config import Platform
 
 logger = logging.getLogger(__name__)
 
@@ -63,7 +63,7 @@ def _type_name(t: int) -> str:
     return _TYPE_NAMES.get(t, f"type{t}")
 
 
-def _platform_enum() -> "Platform":
+def _platform_enum() -> Platform:
     """Resolve the Platform enum member, self-healing if plugins aren't loaded."""
     try:
         return Platform(PLATFORM_NAME)
@@ -86,7 +86,13 @@ def _default_base_url() -> str:
     return (os.getenv("WEKIT_BASE_URL") or "").rstrip("/")
 
 
-_WAIT_RE = re.compile(r"^ConvId='(.*?)',Sender='(.*?)',Type=(\d+),Content='(.*)'$", re.S)
+_WAIT_RE = re.compile(r"^ConvId='(.*?)',Sender='(.*?)',Type=(\d+),Content='(.*)'$", re.DOTALL)
+
+
+def _read_bytes(path: str) -> bytes:
+    """Blocking file read, run in a worker thread by _load_image."""
+    with open(path, "rb") as f:
+        return f.read()
 
 
 class WeKitAdapter(BasePlatformAdapter):
@@ -124,9 +130,9 @@ class WeKitAdapter(BasePlatformAdapter):
             os.getenv("WEKIT_ALLOW_ALL_USERS") or extra.get("allow_all_users") or ""
         ).lower() in ("1", "true", "yes")
 
-        self._client: Optional[httpx.AsyncClient] = None
-        self._mcp_sid: Optional[str] = None
-        self._poll_task: Optional[asyncio.Task] = None
+        self._client: httpx.AsyncClient | None = None
+        self._mcp_sid: str | None = None
+        self._poll_task: asyncio.Task | None = None
         self._stopping = False
         self._connected = False
         # In-flight dispatch tasks. The poll loop deliberately does not await
@@ -136,15 +142,15 @@ class WeKitAdapter(BasePlatformAdapter):
         # Display-name cache. Resolving a name costs an HTTP round trip to the
         # phone, and names change rarely, so caching keeps that off the path
         # every inbound message travels.
-        self._name_cache: Dict[str, str] = {}
+        self._name_cache: dict[str, str] = {}
 
     # ── HTTP plumbing ─────────────────────────────────────────────────────
 
-    def _auth(self) -> Dict[str, str]:
+    def _auth(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {self.token}"}
 
-    async def _mcp_post(self, method: str, params: Optional[dict], _id: Optional[int]):
-        body: Dict[str, Any] = {"jsonrpc": "2.0", "method": method}
+    async def _mcp_post(self, method: str, params: dict | None, _id: int | None):
+        body: dict[str, Any] = {"jsonrpc": "2.0", "method": method}
         if _id is not None:
             body["id"] = _id
         if params is not None:
@@ -178,7 +184,7 @@ class WeKitAdapter(BasePlatformAdapter):
         except Exception:
             logger.debug("wechat-wekit: initialized notification failed", exc_info=True)
 
-    async def _wait_new_message(self) -> Optional[dict]:
+    async def _wait_new_message(self) -> dict | None:
         await self._ensure_mcp()
         r = await self._mcp_post(
             "tools/call",
@@ -243,7 +249,7 @@ class WeKitAdapter(BasePlatformAdapter):
         logger.info("wechat-wekit: inbound poll loop stopped")
 
     @staticmethod
-    def _log_dispatch_error(task: "asyncio.Task") -> None:
+    def _log_dispatch_error(task: asyncio.Task) -> None:
         """A failed background dispatch must be audible, or the message just
         vanishes with nothing in the log to explain it."""
         if task.cancelled():
@@ -265,7 +271,7 @@ class WeKitAdapter(BasePlatformAdapter):
         # so it never re-delivers the same message; deduping on text would wrongly
         # swallow a user legitimately sending the same words twice.
 
-        is_group = conv_id.endswith("@chatroom") or conv_id.endswith("@im.chatroom")
+        is_group = conv_id.endswith(("@chatroom", "@im.chatroom"))
 
         if self.allowed_contacts and not self.allow_all:
             who = {conv_id, sender}
@@ -339,10 +345,8 @@ class WeKitAdapter(BasePlatformAdapter):
         self._stopping = True
         if self._poll_task:
             self._poll_task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self._poll_task
-            except (asyncio.CancelledError, Exception):
-                pass
             self._poll_task = None
         # Give in-flight dispatches a moment to deliver replies they have already
         # generated, rather than cutting a user off mid-sentence. Bounded, because
@@ -350,7 +354,7 @@ class WeKitAdapter(BasePlatformAdapter):
         if self._inflight:
             pending = list(self._inflight)
             logger.info("wechat-wekit: waiting for %d in-flight dispatch(es)", len(pending))
-            done, still = await asyncio.wait(pending, timeout=10)
+            _done, still = await asyncio.wait(pending, timeout=10)
             for t in still:
                 t.cancel()
         if self._client:
@@ -380,7 +384,8 @@ class WeKitAdapter(BasePlatformAdapter):
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         return None
 
-    async def send_image(self, chat_id: str, image_url: str, caption: str = None, **kwargs) -> SendResult:
+    async def send_image(self, chat_id: str, image_url: str,
+                         caption: str | None = None, **kwargs) -> SendResult:
         # WeKit /api/messages/image takes multipart: convId form field + file part.
         # Hermes' image lives in WSL, unreachable from the phone-side server, so we
         # always upload the bytes (never the JSON {convId, path} mode, whose path is
@@ -426,24 +431,27 @@ class WeKitAdapter(BasePlatformAdapter):
         if u.startswith(("http://", "https://")):
             rr = await self._client.get(u)
             rr.raise_for_status()
-            ctype = rr.headers.get("content-type", "image/jpeg").split(";")[0].strip() or "image/jpeg"
+            ctype = (rr.headers.get("content-type", "image/jpeg").split(";")[0].strip()
+                     or "image/jpeg")
             name = _os.path.basename(urllib.parse.urlparse(u).path) or "image"
             if "." not in name:
                 name += mimetypes.guess_extension(ctype) or ".jpg"
             return rr.content, name, ctype
         if u.startswith("file://"):
             u = urllib.parse.urlparse(u).path
-        with open(u, "rb") as f:
-            data = f.read()
+        # Read off the event loop: this coroutine shares a loop with the inbound
+        # poll, and a blocking read of a large image would stall the long poll —
+        # which, given the edge-triggered listener, means dropped messages.
+        data = await asyncio.to_thread(_read_bytes, u)
         ctype = mimetypes.guess_type(u)[0] or "image/png"
         return data, (_os.path.basename(u) or "image.png"), ctype
 
-    async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
-        is_group = chat_id.endswith("@chatroom") or chat_id.endswith("@im.chatroom")
+    async def get_chat_info(self, chat_id: str) -> dict[str, Any]:
+        is_group = chat_id.endswith(("@chatroom", "@im.chatroom"))
         name = await self._contact_name(chat_id) or chat_id
         return {"name": name, "type": "group" if is_group else "dm", "chat_id": chat_id}
 
-    async def _contact_name(self, wx_id: str) -> Optional[str]:
+    async def _contact_name(self, wx_id: str) -> str | None:
         if not self._client or not wx_id:
             return None
         cached = self._name_cache.get(wx_id)
@@ -483,16 +491,16 @@ def is_connected(adapter) -> bool:
     return bool(getattr(adapter, "_connected", False))
 
 
-def _env_enablement() -> Optional[dict]:
+def _env_enablement() -> dict | None:
     """Surface env-only setups in `hermes gateway status` before instantiation."""
     token = os.getenv("WEKIT_TOKEN")
     if not token:
         return None
-    extra: Dict[str, Any] = {"token": token}
+    extra: dict[str, Any] = {"token": token}
     base = os.getenv("WEKIT_BASE_URL")
     if base:
         extra["base_url"] = base
-    result: Dict[str, Any] = {"extra": extra}
+    result: dict[str, Any] = {"extra": extra}
     home = os.getenv("WEKIT_HOME_CHANNEL")
     if home:
         result["home_channel"] = {"chat_id": home, "chat_name": home, "chat_type": "dm"}
