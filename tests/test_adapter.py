@@ -188,3 +188,121 @@ def test_known_message_types_are_named():
 
 def test_unknown_message_types_fall_back_to_a_readable_label():
     assert wk._type_name(12345) == "type12345"
+
+
+# ── WeChat payload decoding ──────────────────────────────────────────────
+#
+# Everything except plain text arrives as an XML blob. Handing that to a model
+# verbatim buries the one useful fact under CDN keys and AES material, so each
+# payload is rendered into a short, actionable line.
+
+from plugin.adapter import describe_payload  # noqa: E402
+
+IMAGE = ('<?xml version="1.0"?><msg><img aeskey="9a598cb2" encryver="1" '
+         'length="245678" hdlength="892134" md5="abc123" /></msg>')
+VOICE = ('<msg><voicemsg endflag="1" voiceformat="4" voicelength="2768" '
+         'aeskey="097f5e4e" fromusername="wxid_abc"></voicemsg></msg>')
+STICKER = ('wxid_abc:0:1:e4f6e764:<msg><emoji fromusername="wxid_abc" '
+           'md5="deadbeef" type="2" /></msg>')
+FILE = ('<msg><appmsg><title><![CDATA[report.xlsx]]></title><type>6</type>'
+        '<appattach><totallen>11251</totallen><fileext>xlsx</fileext>'
+        '</appattach></appmsg></msg>')
+LINK = ('<msg><appmsg><title><![CDATA[An article]]></title><des><![CDATA[worth '
+        'reading]]></des><type>5</type><url><![CDATA[https://example.com/a]]>'
+        '</url></appmsg></msg>')
+QUOTE = ('<msg><appmsg><title>and this?</title><type>57</type><refermsg>'
+         '<displayname>Alice</displayname><content>earlier message</content>'
+         '</refermsg></appmsg></msg>')
+LOCATION = '<msg><location x="31.23" y="121.47" poiname="Some Tower" /></msg>'
+
+
+def test_plain_text_passes_through_untouched():
+    text, kind, _ = describe_payload(1, "hello there")
+    assert text == "hello there"
+    assert kind == "text"
+
+
+def test_image_reports_size_and_photo_kind():
+    text, kind, meta = describe_payload(3, IMAGE)
+    assert kind == "photo"
+    assert text.startswith("[Image]")
+    assert "871.2 KB" in text          # prefers hdlength over length
+    assert meta["md5"] == "abc123"
+
+
+def test_voice_reports_duration_in_seconds():
+    text, kind, meta = describe_payload(34, VOICE)
+    assert kind == "voice"
+    assert "2.8s" in text
+    assert meta["duration_ms"] == "2768"
+
+
+def test_sticker_survives_the_routing_prefix():
+    # Stickers arrive as `wxid:0:1:<hash>:<msg>…` — the prefix must be stripped
+    # before parsing or the payload looks like garbage.
+    text, kind, _ = describe_payload(47, STICKER)
+    assert kind == "sticker"
+    assert text == "[Sticker]"
+
+
+def test_file_reports_name_extension_and_size():
+    text, kind, meta = describe_payload(49, FILE)
+    assert kind == "document"
+    assert "report.xlsx" in text
+    assert "XLSX" in text and "11.0 KB" in text
+    assert meta["filename"] == "report.xlsx"
+
+
+def test_file_variant_type_is_handled_the_same():
+    # WeChat also delivers files as 0x41000031 with appmsg type 74.
+    text, kind, meta = describe_payload(1090519089, FILE.replace("<type>6<", "<type>74<"))
+    assert kind == "document"
+    assert "report.xlsx" in text
+    assert meta["appmsg_type"] == 74
+
+
+def test_link_exposes_the_url_so_the_agent_can_follow_it():
+    text, kind, meta = describe_payload(49, LINK)
+    assert kind == "text"
+    assert "https://example.com/a" in text
+    assert meta["url"] == "https://example.com/a"
+
+
+def test_quote_surfaces_both_the_reply_and_what_was_quoted():
+    text, _, meta = describe_payload(49, QUOTE)
+    assert "and this?" in text
+    assert "Alice" in text
+    assert meta["quoted_text"] == "earlier message"
+
+
+def test_location_reports_name_and_coordinates():
+    text, kind, meta = describe_payload(48, LOCATION)
+    assert kind == "location"
+    assert "Some Tower" in text
+    assert meta["lat"] == "31.23"
+
+
+def test_raw_xml_never_reaches_the_model():
+    # The whole point: a model must never be handed the blob.
+    for mtype, payload in ((3, IMAGE), (34, VOICE), (47, STICKER),
+                           (49, FILE), (49, LINK), (48, LOCATION)):
+        text, _, _ = describe_payload(mtype, payload)
+        assert "<msg" not in text and "aeskey" not in text and "<appmsg" not in text
+
+
+def test_unknown_xml_degrades_to_a_label_not_a_blob():
+    text, _, _ = describe_payload(99, "<msg><somethingnew foo='1'/></msg>")
+    assert "<" not in text
+    assert "could not be decoded" in text
+
+
+def test_oversized_payload_is_refused_rather_than_parsed():
+    # Message content is attacker-controlled; parsing is capped.
+    huge = "<msg>" + ("<a/>" * 200_000) + "</msg>"
+    text, _, _ = describe_payload(3, huge)
+    assert "<a/>" not in text
+
+
+def test_malformed_xml_does_not_raise():
+    text, _, _ = describe_payload(3, "<msg><img aeskey='x' UNCLOSED")
+    assert isinstance(text, str) and text

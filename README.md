@@ -156,7 +156,9 @@ Then restart the gateway and watch for `wechat-wekit: connected to …`, followe
 | `WEKIT_ALLOW_ALL_USERS` | No | `1` / `true` / `yes` (case-insensitive) disables the whitelist entirely. Unsafe: anyone who can message the account can drive your agent |
 | `WEKIT_POLL_TIMEOUT_MS` | No | Long-poll duration in ms. Default `30000`, values below `5000` are clamped up |
 | `WEKIT_HOME_CHANNEL` | No | convId that scheduled/cron deliveries are sent to |
-| `WEKIT_ADB_SERIAL` / `WEKIT_ADB_PATH` / `WEKIT_LOG_PATH` | No | Used by the optional phone keepalive watchdog only |
+| `WEKIT_MEDIA_ADB_PATH` | No | Path to `adb`. Setting it turns on best-effort retrieval of received files and images off the phone (see below). Unset = disabled |
+| `WEKIT_MEDIA_DIR` | No | Where retrieved media is written on the agent host. Default `/tmp/wekit-media` |
+| `WEKIT_ADB_SERIAL` / `WEKIT_ADB_PATH` / `WEKIT_LOG_PATH` | No | Device serial for media retrieval; the last two are used by the optional keepalive watchdog |
 | `WEKIT_ROUTER_WAN` / `WEKIT_PHONE_HOSTNAME` | No | Used by the router DNAT script only (its WAN-side address and the phone's DHCP hostname) |
 
 **Populate `WEKIT_ALLOWED_USERS` from wxids you have actually seen in the log**, i.e. the id in `wechat-wekit: inbound from <id> …` — **not** from the contact list. In the reference deployment the whitelist was filled from the friend list and silently dropped every message the user sent, because they were writing from a different account than the one in that list. The drop is logged at `debug` level, so with default log settings the channel simply looks dead.
@@ -228,13 +230,64 @@ Useful facts behind this design: WeKit's API+MCP server toggle **persists across
 | Scheduled / cron delivery | ✅ | Target set by `WEKIT_HOME_CHANNEL` |
 | Inbound whitelist | ✅ | Matched against the conversation id **or** the sender id |
 | No echo loop | ✅ | WeKit does not report the agent's own outgoing messages |
-| Receive non-text (image/voice/file/…) | ⚠️ Partial | If WeKit reports empty content, a type label such as `[image message]` is substituted; otherwise the raw string passes through. The media itself is **not** downloaded |
+| Receive non-text (image/voice/file/link/sticker/location/quote) | ✅ | Every payload is decoded into a short, actionable line — filename and size for files, duration for voice, the actual URL for links, the quoted text for replies. The raw XML never reaches the model |
+| Receive the media *itself* | ⚠️ Best-effort | See [Receiving files and images](#receiving-files-and-images). Requires adb access to the phone, and the media must already be downloaded there |
 | Chat history / backfill | ❌ Not used | WeKit exposes conversation history endpoints; this plugin never reads them. See below |
 | Quote / reply threading | ❌ | `reply_to` is accepted and ignored — replies are ordinary messages, not WeChat quotes |
 | Typing indicator | ❌ | `send_typing` is a no-op |
 | Voice / video / file / location / transfer | ❌ | WeKit's API has endpoints for these; this plugin does not wire them up |
 
 Replies are sent as plain text — WeChat renders no markdown. The registered `max_message_length` is 2000.
+
+## Receiving files and images
+
+Every incoming message type is decoded into a short line the agent can act on,
+rather than the XML blob WeChat actually sends:
+
+| Sent | The agent sees |
+|---|---|
+| Image | `[Image] — 871.2 KB` |
+| Voice | `[Voice message] — 2.8s` |
+| File | `[File] report.xlsx — XLSX, 11.0 KB` |
+| Article / link | `[Link] <title>` + description + **the real URL**, so the agent can go read it |
+| Reply | `[Reply to Alice] <the reply>`, with the quoted text in `reply_to_text` |
+| Sticker / location / mini program / transfer / … | a matching one-line summary |
+
+Getting the **actual bytes** is harder, and the reason is upstream: every WeKit
+download endpoint takes a `msgSvrId`, and no WeKit API ever returns one —
+`wait-for-new-message` reports only ConvId, Sender, Type and Content. So the
+media cannot be pulled through WeKit itself.
+
+Set `WEKIT_MEDIA_ADB_PATH` and the plugin will instead copy the file WeChat
+already wrote to its own storage, over adb:
+
+```bash
+WEKIT_MEDIA_ADB_PATH=/path/to/adb
+WEKIT_ADB_SERIAL=YOURSERIAL          # optional when only one device is attached
+WEKIT_MEDIA_DIR=/var/lib/hermes/wechat-media
+```
+
+Retrieved media is written there and passed to the agent in `media_urls`, so
+vision tools can open an image and file tools can read a document. Know the
+edges before relying on it:
+
+- **The media has to be on the phone already.** WeChat downloads a file only
+  when someone taps it, unless auto-download is enabled (WeChat → Me → Settings
+  → General → Photos, Videos, Files and Calls). Without that, a file message is
+  metadata only and there is nothing to copy.
+- **Files are matched by exact filename**, which is unambiguous. **Images have
+  no usable name in the payload**, so the newest image written near the time the
+  message arrived is taken — a heuristic, bounded to a short window.
+- Images WeChat stored in its own `wxgf` container are **discarded rather than
+  attached**, because nothing downstream can open them. Ordinary JPEG/PNG/GIF —
+  including the XOR-obfuscated variants — come through fine.
+- adb is flaky enough that calls are retried; a failure is never fatal, the
+  agent just keeps the text description.
+
+If you want this to be reliable rather than best-effort, the fix belongs
+upstream: `wait-for-new-message` already holds `msgSvrId` in the row it reads
+and would only need to include it in the response, after which the documented
+`download-file` / `download-image` endpoints would do the job properly.
 
 ## Known limitations
 

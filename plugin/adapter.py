@@ -36,8 +36,10 @@ import datetime
 import logging
 import os
 import re
+import shlex
 import time
 from typing import Any
+from xml.etree import ElementTree
 
 import httpx
 from gateway.config import Platform
@@ -58,9 +60,417 @@ _TYPE_NAMES = {
     47: "sticker", 48: "location", 49: "file/link/app", 10000: "system",
 }
 
+# `type` on an <appmsg>. WeChat multiplexes a dozen different things through
+# message type 49 (and its 0x41000031 variant), so the real kind is in here.
+_APPMSG_KINDS = {
+    3: "music", 4: "video", 5: "link", 6: "file", 8: "sticker",
+    19: "forwarded chat history", 24: "note", 33: "mini program",
+    36: "mini program", 51: "channels video", 57: "quote",
+    63: "channels live", 74: "file", 2000: "transfer", 2001: "red packet",
+}
+
+# Anything an unauthenticated peer can send us ends up here, so parsing is
+# capped rather than trusted.
+_MAX_XML_CHARS = 512_000
+
+_XML_START = re.compile(r"<\?xml|<msg\b")
+
+# Our media-kind strings mapped onto Hermes' own MessageType enum, so the agent
+# routes an image like an image rather than like text.
+_MEDIA_KIND_TO_TYPE = {
+    "photo": MessageType.PHOTO,
+    "voice": MessageType.VOICE,
+    "video": MessageType.VIDEO,
+    "document": MessageType.DOCUMENT,
+    "sticker": MessageType.STICKER,
+    "location": MessageType.LOCATION,
+    "text": MessageType.TEXT,
+}
+
 
 def _type_name(t: int) -> str:
     return _TYPE_NAMES.get(t, f"type{t}")
+
+
+def _human_size(n) -> str:
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        return ""
+    if n < 1024:
+        return f"{n} B"
+    if n < 1024 * 1024:
+        return f"{n / 1024:.1f} KB"
+    if n < 1024 * 1024 * 1024:
+        return f"{n / 1024 / 1024:.1f} MB"
+    return f"{n / 1024 / 1024 / 1024:.2f} GB"
+
+
+def _strip_payload_prefix(raw: str) -> str:
+    """Drop WeChat's routing prefix so the XML starts at character zero.
+
+    Group payloads arrive as ``wxid_sender:\\n<msg>…`` and some direct payloads
+    (stickers in particular) as ``wxid:0:1:<hash>:<msg>…``. WeKit strips the
+    group form for us but not the others.
+    """
+    m = _XML_START.search(raw)
+    return raw[m.start():] if m else raw
+
+
+def _parse_xml(payload: str):
+    """Best-effort parse of a WeChat XML payload; None when it isn't XML.
+
+    ElementTree is used with a size cap and never resolves external entities,
+    because this input is controlled by whoever messaged the account.
+    """
+    if not payload or len(payload) > _MAX_XML_CHARS:
+        return None
+    try:
+        parser = ElementTree.XMLParser()
+        parser.feed(payload)
+        return parser.close()
+    except Exception:
+        return None
+
+
+def _attr(el, *names, default=""):
+    """First present attribute among *names*."""
+    if el is None:
+        return default
+    for n in names:
+        v = el.get(n)
+        if v:
+            return v
+    return default
+
+
+def _text_of(root, *paths, default=""):
+    """Text of the first matching child path."""
+    if root is None:
+        return default
+    for p in paths:
+        el = root.find(p)
+        if el is not None and el.text and el.text.strip():
+            return el.text.strip()
+    return default
+
+
+def _describe_appmsg(app) -> tuple[str, str, dict]:
+    """Render an <appmsg> (WeChat's catch-all container) as readable text."""
+    try:
+        kind_no = int(_text_of(app, "type", default="0") or 0)
+    except ValueError:
+        kind_no = 0
+    kind = _APPMSG_KINDS.get(kind_no, f"app message (type {kind_no})")
+    title = _text_of(app, "title")
+    desc = _text_of(app, "des")
+    url = _text_of(app, "url")
+    att = app.find("appattach")
+    size = _human_size(_text_of(att, "totallen")) if att is not None else ""
+    ext = _text_of(att, "fileext") if att is not None else ""
+    meta: dict[str, Any] = {"appmsg_type": kind_no, "kind": kind}
+
+    if kind_no in (6, 74):  # file transfer
+        name = title or "(unnamed)"
+        bits = [b for b in (ext.upper() if ext else "", size) if b]
+        meta.update({"filename": name, "fileext": ext, "size": size})
+        suffix = f" — {', '.join(bits)}" if bits else ""
+        note = ("(The file itself was not transferred to the agent — only this "
+                "description. Ask the sender to paste the contents if you need them.)")
+        return f"[File] {name}{suffix}\n{note}", "document", meta
+
+    if kind_no in (5, 33, 36, 51, 63):  # link-ish
+        label = {5: "Link", 33: "Mini program", 36: "Mini program",
+                 51: "Channels video", 63: "Channels live"}.get(kind_no, "Link")
+        src = _text_of(app, "sourcedisplayname")
+        parts = [f"[{label}] {title}" if title else f"[{label}]"]
+        if desc:
+            parts.append(desc)
+        if url:
+            parts.append(url)
+        if src:
+            parts.append(f"(from {src})")
+        meta.update({"title": title, "url": url, "source": src})
+        return "\n".join(parts), "text", meta
+
+    if kind_no == 57:  # quote / reply
+        refer = app.find("refermsg")
+        quoted = _text_of(refer, "content") if refer is not None else ""
+        who = _text_of(refer, "displayname", "chatusr") if refer is not None else ""
+        # A quoted media message nests another payload; summarise it too.
+        if quoted and _XML_START.search(quoted):
+            inner_root = _parse_xml(_strip_payload_prefix(quoted))
+            if inner_root is not None:
+                inner_app = inner_root.find(".//appmsg")
+                if inner_app is not None:
+                    quoted = _describe_appmsg(inner_app)[0].splitlines()[0]
+                else:
+                    quoted = _describe_media(inner_root)[0]
+        meta.update({"quoted_text": quoted, "quoted_from": who})
+        head = f"[Reply to {who}]" if who else "[Reply]"
+        return f"{head} {title}".strip(), "text", meta
+
+    if kind_no == 19:  # merged forward of a conversation
+        meta["title"] = title
+        return (f"[Forwarded chat history] {title}\n{desc}".strip()), "text", meta
+
+    if kind_no in (2000, 2001):
+        label = "Transfer" if kind_no == 2000 else "Red packet"
+        return f"[{label}] {title or desc}".strip(), "text", meta
+
+    body = " — ".join([x for x in (title, desc) if x])
+    return f"[{kind}] {body}".strip(" —"), "text", meta
+
+
+def _describe_media(root) -> tuple[str, str, dict]:
+    """Render the non-appmsg media payloads (image, voice, video, …)."""
+    img = root.find(".//img")
+    if img is not None:
+        size = _human_size(_attr(img, "hdlength", "length"))
+        meta = {"md5": _attr(img, "md5"), "size": size}
+        return f"[Image]{f' — {size}' if size else ''}", "photo", meta
+
+    voice = root.find(".//voicemsg")
+    if voice is not None:
+        ms = _attr(voice, "voicelength")
+        secs = f"{int(ms) / 1000:.1f}s" if ms.isdigit() else ""
+        meta = {"duration_ms": ms, "format": _attr(voice, "voiceformat")}
+        return (f"[Voice message]{f' — {secs}' if secs else ''}\n"
+                f"(Audio was not transferred to the agent; it has not been "
+                f"transcribed.)"), "voice", meta
+
+    video = root.find(".//videomsg")
+    if video is not None:
+        secs = _attr(video, "playlength")
+        size = _human_size(_attr(video, "length"))
+        bits = [b for b in (f"{secs}s" if secs else "", size) if b]
+        return f"[Video]{f' — {chr(44).join(bits)}' if bits else ''}", "video", {"size": size}
+
+    emoji = root.find(".//emoji")
+    if emoji is not None:
+        return "[Sticker]", "sticker", {"md5": _attr(emoji, "md5")}
+
+    loc = root.find(".//location")
+    if loc is not None:
+        label = _attr(loc, "poiname", "label")
+        x, y = _attr(loc, "x"), _attr(loc, "y")
+        coords = f" ({x}, {y})" if x and y else ""
+        return f"[Location] {label}{coords}".strip(), "location", {"lat": x, "lon": y}
+
+    return "", "text", {}
+
+
+class PhoneMediaFetcher:
+    """Best-effort retrieval of received media off the phone, over adb.
+
+    WeKit can download media, but every one of its download endpoints requires a
+    ``msgSvrId`` and no WeKit API surface ever hands one out — ``wait-for-new-message``
+    returns only ConvId/Sender/Type/Content. So the media cannot be pulled through
+    WeKit itself. What we can do is look for the file WeChat already wrote to its
+    own storage and copy that.
+
+    Consequences worth knowing before relying on this:
+
+    * A file is only on the phone once WeChat has actually downloaded it — i.e.
+      someone tapped the bubble, or auto-download is enabled in WeChat under
+      Settings → General → Photos, Videos, Files and Calls. Otherwise a file
+      message is metadata only and there is nothing to fetch.
+    * Files are matched by their exact filename, which is unambiguous. Images
+      have no usable name in the payload, so the newest image written around the
+      time the message arrived is used — a heuristic, deliberately bounded to a
+      short window.
+
+    Everything here is optional and failure is never fatal: if adb is unavailable
+    or the media is not on the phone, the caller keeps the text description.
+    """
+
+    # WeChat obfuscates stored images with a single-byte XOR; the key is
+    # recovered from any known magic byte.
+    _MAGIC = ((0xFF, 0xD8, 0xFF), (0x89, 0x50, 0x4E), (0x47, 0x49, 0x46))
+
+    def __init__(self, adb_path: str, serial: str, dest_dir: str, window_s: int = 180):
+        self.adb_path = adb_path
+        self.serial = serial
+        self.dest_dir = dest_dir
+        self.window_s = window_s
+
+    @classmethod
+    def from_env(cls) -> PhoneMediaFetcher | None:
+        adb = os.getenv("WEKIT_MEDIA_ADB_PATH") or ""
+        if not adb:
+            return None
+        dest = os.getenv("WEKIT_MEDIA_DIR") or "/tmp/wekit-media"
+        try:
+            os.makedirs(dest, exist_ok=True)
+        except OSError:
+            logger.warning("wechat-wekit: cannot create WEKIT_MEDIA_DIR %s", dest)
+            return None
+        return cls(adb, os.getenv("WEKIT_ADB_SERIAL") or "", dest)
+
+    async def _adb(self, *args: str, timeout: float = 45.0,
+                   attempts: int = 3) -> tuple[int, bytes]:
+        """Run an adb command, retrying transient failures.
+
+        The adb server is not dependable — on the reference host it crashed and
+        respawned by itself every 10-30 seconds, so any single invocation has a
+        real chance of failing for reasons unrelated to the request. Retrying is
+        cheap here because each call is one-shot, unlike the long poll, which is
+        why the message transport deliberately does not go through adb at all.
+        """
+        last: tuple[int, bytes] = (1, b"")
+        for i in range(attempts):
+            last = await self._adb_once(*args, timeout=timeout)
+            if last[0] == 0:
+                return last
+            if i + 1 < attempts:
+                await asyncio.sleep(1.0 * (i + 1))
+        return last
+
+    async def _adb_once(self, *args: str, timeout: float = 45.0) -> tuple[int, bytes]:
+        cmd = [self.adb_path]
+        if self.serial:
+            cmd += ["-s", self.serial]
+        cmd += list(args)
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+            stdin=asyncio.subprocess.DEVNULL,
+        )
+        try:
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        except asyncio.TimeoutError:
+            proc.kill()
+            return 1, b""
+        return proc.returncode or 0, out or b""
+
+    async def _su(self, script: str, timeout: float = 45.0) -> str:
+        rc, out = await self._adb("shell", f"su -c {shlex.quote(script)}", timeout=timeout)
+        return out.decode("utf-8", "replace").replace("\r", "") if rc == 0 else ""
+
+    async def _locate_file(self, filename: str) -> str:
+        listing = await self._su(
+            "find /data/data/com.tencent.mm /sdcard/Android/data/com.tencent.mm "
+            f"-type f -name {shlex.quote(filename)} 2>/dev/null | head -1"
+        )
+        return listing.strip().splitlines()[0].strip() if listing.strip() else ""
+
+    async def _locate_recent_image(self) -> str:
+        # Newest image written inside the window, preferring a full image over a
+        # thumbnail (WeChat names thumbnails th_*).
+        script = (
+            "for d in /data/data/com.tencent.mm/MicroMsg/*/image2; do "
+            f'[ -d "$d" ] && find "$d" -type f '
+            f"-mmin -{max(1, self.window_s // 60)} 2>/dev/null; "
+            "done | head -40"
+        )
+        out = await self._su(script)
+        paths = [p.strip() for p in out.splitlines() if p.strip()]
+        if not paths:
+            return ""
+        full = [p for p in paths if not os.path.basename(p).startswith("th_")]
+        return (full or paths)[0]
+
+    @classmethod
+    def _deobfuscate(cls, data: bytes) -> bytes:
+        """Undo WeChat's single-byte XOR on stored images, when present."""
+        if len(data) < 3:
+            return data
+        for magic in cls._MAGIC:
+            key = data[0] ^ magic[0]
+            if key == 0:
+                return data  # already plain
+            if all(data[i] ^ key == magic[i] for i in range(3)):
+                return bytes(b ^ key for b in data)
+        return data
+
+    async def fetch(self, kind: str, meta: dict) -> str:
+        """Return a local path on the agent host, or "" when unavailable."""
+        try:
+            if kind == "document" and meta.get("filename"):
+                remote = await self._locate_file(meta["filename"])
+                local_name = meta["filename"]
+            elif kind == "photo":
+                remote = await self._locate_recent_image()
+                local_name = os.path.basename(remote) if remote else ""
+            else:
+                return ""
+            if not remote:
+                return ""
+
+            staged = f"/sdcard/Download/wekit-fetch-{int(time.time() * 1000)}"
+            if not await self._su(f"cp {shlex.quote(remote)} {shlex.quote(staged)} && echo ok"):
+                return ""
+            await self._su(f"chmod 644 {shlex.quote(staged)}")
+
+            local = os.path.join(self.dest_dir, f"{int(time.time() * 1000)}_{local_name}")
+            rc, _ = await self._adb("pull", staged, local)
+            await self._su(f"rm -f {shlex.quote(staged)}")
+            if rc != 0 or not await asyncio.to_thread(os.path.exists, local):
+                return ""
+
+            if kind == "photo":
+                raw = await asyncio.to_thread(_read_bytes, local)
+                fixed = self._deobfuscate(raw)
+                if fixed is not raw:
+                    await asyncio.to_thread(_write_bytes, local, fixed)
+                    raw = fixed
+                if not self._is_readable_image(raw):
+                    # WeChat also stores images in its own "wxgf" container,
+                    # which nothing downstream can open. Handing that to the
+                    # agent as an image would be worse than sending nothing.
+                    logger.debug("wechat-wekit: pulled image is not a readable "
+                                 "format (%s), discarding", raw[:4])
+                    with contextlib.suppress(OSError):
+                        os.remove(local)
+                    return ""
+            return local
+        except Exception:
+            logger.debug("wechat-wekit: media fetch failed", exc_info=True)
+            return ""
+
+    @classmethod
+    def _is_readable_image(cls, data: bytes) -> bool:
+        """True when the bytes are something downstream can actually open."""
+        return len(data) > 3 and any(tuple(data[:3]) == m for m in cls._MAGIC)
+
+
+def _attach_note(text: str, kind: str, local_path: str) -> str:
+    """Replace the "not transferred" caveat once the media actually arrived."""
+    lines = [ln for ln in text.splitlines()
+             if "was not transferred to the agent" not in ln]
+    what = "file" if kind == "document" else "image"
+    lines.append(f"(The {what} is attached and readable at: {local_path})")
+    return "\n".join(lines)
+
+
+def describe_payload(mtype: int, raw: str) -> tuple[str, str, dict]:
+    """Turn a raw WeChat payload into (readable text, media kind, metadata).
+
+    WeChat delivers everything except plain text as an XML blob. Handing that
+    blob to a language model verbatim is worse than useless — it buries the one
+    fact that matters (a file called X arrived) under a wall of CDN keys. This
+    renders each payload as a short line a model can act on, and keeps the
+    structured bits in metadata.
+    """
+    if mtype == 1:
+        return raw, "text", {}
+
+    payload = _strip_payload_prefix(raw or "")
+    root = _parse_xml(payload)
+
+    if root is not None:
+        app = root.find(".//appmsg")
+        if app is not None:
+            return _describe_appmsg(app)
+        text, kind, meta = _describe_media(root)
+        if text:
+            return text, kind, meta
+
+    # Unknown shape: never dump raw XML at a model. Say what we know.
+    name = _type_name(mtype)
+    if payload.lstrip().startswith("<"):
+        logger.debug("wechat-wekit: unrecognised payload for type %s: %r", mtype, payload[:400])
+        return f"[{name} message] (content could not be decoded)", "text", {"raw_type": mtype}
+    return (raw or f"[{name} message]"), "text", {"raw_type": mtype}
 
 
 def _platform_enum() -> Platform:
@@ -93,6 +503,12 @@ def _read_bytes(path: str) -> bytes:
     """Blocking file read, run in a worker thread by _load_image."""
     with open(path, "rb") as f:
         return f.read()
+
+
+def _write_bytes(path: str, data: bytes) -> None:
+    """Blocking file write, run in a worker thread."""
+    with open(path, "wb") as f:
+        f.write(data)
 
 
 class WeKitAdapter(BasePlatformAdapter):
@@ -143,6 +559,11 @@ class WeKitAdapter(BasePlatformAdapter):
         # phone, and names change rarely, so caching keeps that off the path
         # every inbound message travels.
         self._name_cache: dict[str, str] = {}
+        # Optional: pull received media off the phone so the agent can actually
+        # open it. Disabled unless WEKIT_MEDIA_ADB_PATH is set.
+        self._media = PhoneMediaFetcher.from_env()
+        if self._media:
+            logger.info("wechat-wekit: phone media fetch enabled (adb)")
 
     # ── HTTP plumbing ─────────────────────────────────────────────────────
 
@@ -264,8 +685,12 @@ class WeKitAdapter(BasePlatformAdapter):
         content = msg["content"]
         mtype = msg["type"]
 
-        if mtype != 1 and not content:
-            content = f"[{_type_name(mtype)} message]"
+        # Everything except plain text arrives as a WeChat XML blob. Render it
+        # into something a model can act on; handing over the raw XML buries the
+        # one useful fact under a wall of CDN keys and AES material.
+        text, kind, meta = describe_payload(mtype, content)
+        if not text:
+            text = f"[{_type_name(mtype)} message]"
 
         # No content-based dedup: wait-for-new-message fires once per DB insert,
         # so it never re-delivers the same message; deduping on text would wrongly
@@ -279,6 +704,19 @@ class WeKitAdapter(BasePlatformAdapter):
                 logger.debug("wechat-wekit: drop msg from unlisted %s", conv_id)
                 return
 
+        # Try to put the actual file in the agent's hands. Safe to run here:
+        # _dispatch is already a background task, so a slow phone cannot stall
+        # the poll loop. Failure just leaves the text description in place.
+        media_urls: list[str] = []
+        media_types: list[str] = []
+        if self._media and kind in ("document", "photo"):
+            local = await self._media.fetch(kind, meta)
+            if local:
+                media_urls = [local]
+                media_types = [kind]
+                text = _attach_note(text, kind, local)
+                logger.info("wechat-wekit: fetched %s from phone -> %s", kind, local)
+
         name = await self._contact_name(conv_id) or conv_id
         source = self.build_source(
             chat_id=conv_id,
@@ -288,11 +726,17 @@ class WeKitAdapter(BasePlatformAdapter):
             user_name=(await self._contact_name(sender) or sender) if is_group else name,
         )
         event = MessageEvent(
-            text=content,
-            message_type=MessageType.TEXT,
+            text=text,
+            message_type=_MEDIA_KIND_TO_TYPE.get(kind, MessageType.TEXT),
             source=source,
             message_id=str(int(time.time() * 1000)),
             timestamp=datetime.datetime.now(),
+            # Keep the untouched payload available to anything downstream that
+            # wants more than the summary.
+            raw_message={"type": mtype, "content": content, "meta": meta},
+            reply_to_text=meta.get("quoted_text") or None,
+            media_urls=media_urls,
+            media_types=media_types,
         )
         await self.handle_message(event)
 

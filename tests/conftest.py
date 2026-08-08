@@ -27,8 +27,16 @@ class _SendResult:
 
 
 class _MessageType(str, Enum):
+    # Mirrors gateway.platforms.base.MessageType — keep in step with Hermes.
     TEXT = "text"
-    IMAGE = "image"
+    LOCATION = "location"
+    PHOTO = "photo"
+    VIDEO = "video"
+    AUDIO = "audio"
+    VOICE = "voice"
+    DOCUMENT = "document"
+    STICKER = "sticker"
+    COMMAND = "command"
 
 
 @dataclass
