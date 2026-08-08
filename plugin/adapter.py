@@ -33,6 +33,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import datetime
+import hashlib
 import logging
 import os
 import re
@@ -479,6 +480,69 @@ class PhoneMediaFetcher:
         """True when the bytes are something downstream can actually open."""
         return len(data) > 3 and any(tuple(data[:3]) == m for m in cls._MAGIC)
 
+    # ── official-account articles ─────────────────────────────────────────
+    #
+    # An article URL cannot be fetched from anywhere but a real WeChat client:
+    # mp.weixin.qq.com redirects everything else to a captcha ("环境异常").
+    # It also cannot be read out of the app programmatically — the article
+    # renders in WeChat's separate :tools process, which WeKit's WebView
+    # tracking does not reach, and its text never enters the accessibility
+    # tree, so a UI dump comes back empty.
+    #
+    # What does work is the screen. The article renders normally and is not
+    # FLAG_SECURE, so it can be opened on the phone, scrolled, and captured —
+    # and the agent reads the resulting images the same way it reads any other
+    # picture. Slower and less exact than HTML, but it is the one path that
+    # actually produces the content.
+
+    ARTICLE_HOSTS = ("mp.weixin.qq.com",)
+    _ARTICLE_ACTIVITY = "com.tencent.mm/.plugin.webview.ui.tools.WebViewUI"
+
+    @classmethod
+    def is_article(cls, url: str) -> bool:
+        return bool(url) and any(h in url for h in cls.ARTICLE_HOSTS)
+
+    async def capture_article(self, url: str, max_pages: int = 12) -> list[str]:
+        """Open an article on the phone and return screenshots of it.
+
+        Returns local paths on the agent host, top of the article first.
+        """
+        shots: list[str] = []
+        try:
+            await self._su("input keyevent KEYCODE_WAKEUP")
+            await self._su("wm dismiss-keyguard")
+            # The activity is not exported, so it has to be started as root.
+            await self._su(f"am start -n {self._ARTICLE_ACTIVITY} "
+                           f"-e rawUrl {shlex.quote(url)}")
+            await asyncio.sleep(6.0)   # let the page load
+
+            stamp = int(time.time() * 1000)
+            previous = None
+            for page in range(max_pages):
+                rc, png = await self._adb("exec-out", "screencap", "-p", timeout=40)
+                if rc != 0 or len(png) < 1024:
+                    break
+                # Two identical screens means the article stopped scrolling.
+                digest = hashlib.sha256(png).hexdigest()
+                if digest == previous:
+                    break
+                previous = digest
+
+                local = os.path.join(self.dest_dir, f"{stamp}_article_{page:02d}.png")
+                await asyncio.to_thread(_write_bytes, local, png)
+                shots.append(local)
+
+                # Scroll by roughly one screen, leaving an overlap so no line is
+                # lost between captures.
+                await self._su("input swipe 500 1700 500 400 400")
+                await asyncio.sleep(1.5)
+        except Exception:
+            logger.debug("wechat-wekit: article capture failed", exc_info=True)
+        finally:
+            with contextlib.suppress(Exception):
+                await self._su("input keyevent KEYCODE_HOME")
+        return shots
+
 
 def _attach_note(text: str, kind: str, local_path: str) -> str:
     """Replace the "not transferred" caveat once the media actually arrived."""
@@ -609,8 +673,14 @@ class WeKitAdapter(BasePlatformAdapter):
         # Optional: pull received media off the phone so the agent can actually
         # open it. Disabled unless WEKIT_MEDIA_ADB_PATH is set.
         self._media = PhoneMediaFetcher.from_env()
+        # Capturing an article takes over the phone's screen for a few seconds,
+        # so it stays opt-in even when media fetching is on.
+        self._capture_articles = str(
+            os.getenv("WEKIT_CAPTURE_ARTICLES") or ""
+        ).lower() in ("1", "true", "yes")
         if self._media:
-            logger.info("wechat-wekit: phone media fetch enabled (adb)")
+            logger.info("wechat-wekit: phone media fetch enabled (adb)%s",
+                        "; article capture on" if self._capture_articles else "")
 
     # ── HTTP plumbing ─────────────────────────────────────────────────────
 
@@ -763,6 +833,18 @@ class WeKitAdapter(BasePlatformAdapter):
                 media_types = [kind]
                 text = _attach_note(text, kind, local)
                 logger.info("wechat-wekit: fetched %s from phone -> %s", kind, local)
+        elif self._media and self._capture_articles and \
+                self._media.is_article(meta.get("url", "")):
+            # The agent cannot open this link itself — see capture_article.
+            shots = await self._media.capture_article(meta["url"])
+            if shots:
+                media_urls = shots
+                media_types = ["photo"] * len(shots)
+                text += (f"\n(The agent cannot fetch this link directly — WeChat "
+                         f"only serves it to its own client. It was opened on the "
+                         f"phone and captured as {len(shots)} screenshot(s), "
+                         f"attached above in reading order.)")
+                logger.info("wechat-wekit: captured article in %d screenshot(s)", len(shots))
 
         name = await self._contact_name(conv_id) or conv_id
         source = self.build_source(

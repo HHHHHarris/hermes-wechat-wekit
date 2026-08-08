@@ -158,6 +158,7 @@ Then restart the gateway and watch for `wechat-wekit: connected to …`, followe
 | `WEKIT_HOME_CHANNEL` | No | convId that scheduled/cron deliveries are sent to |
 | `WEKIT_MEDIA_ADB_PATH` | No | Path to `adb`. Setting it turns on retrieval of received files and images off the phone (see below). Unset = disabled |
 | `WEKIT_MEDIA_DIR` | No | Where retrieved media is written on the agent host. Default `/tmp/wekit-media` |
+| `WEKIT_CAPTURE_ARTICLES` | No | `true` opens official-account articles on the phone and attaches screenshots of them. Takes over the screen briefly — see below |
 | `WEKIT_ADB_SERIAL` / `WEKIT_ADB_PATH` / `WEKIT_LOG_PATH` | No | Device serial for media retrieval; the last two are used by the optional keepalive watchdog |
 | `WEKIT_ROUTER_WAN` / `WEKIT_PHONE_HOSTNAME` | No | Used by the router DNAT script only (its WAN-side address and the phone's DHCP hostname) |
 
@@ -336,12 +337,25 @@ WEKIT_MEDIA_DIR=/var/lib/hermes/wechat-media
 - The script also backfills: on startup it queues recently received media that
   arrived before it was installed.
 
-### What is not retrievable
+### Official-account articles
 
-Official-account articles. Fetching `mp.weixin.qq.com` from anywhere but a real
-WeChat client redirects to a captcha page ("环境异常"), and WeKit's WebView
-tracking only sees the main process — articles open in WeChat's separate
-`:tools` process, so its `webview-eval-js` tool cannot reach them either.
+An article link cannot be fetched by the agent, and that is not a proxy or
+network problem: `mp.weixin.qq.com` serves the page only to a real WeChat
+client and redirects everything else to a captcha ("环境异常"). Reading it out
+of the app programmatically does not work either — the article renders in
+WeChat's separate `:tools` process, which WeKit's WebView tracking does not
+reach, and WebView text never enters the accessibility tree (a UI dump of an
+open article comes back empty), so there is no DOM to query.
+
+What does work is the screen. The article renders normally and is not
+FLAG_SECURE. With `WEKIT_CAPTURE_ARTICLES=true`, a link message causes the
+phone to open the article, scroll through it, and capture each screen; the
+images are attached to the message so the agent reads them the way it reads any
+other picture. Capture stops when the screen stops changing, and the phone is
+returned to its home screen afterwards.
+
+It takes over the phone's display for a few seconds per article, which is why
+it is off by default. Set it only on a phone dedicated to the agent.
 
 
 ## Known limitations
