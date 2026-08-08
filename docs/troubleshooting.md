@@ -15,7 +15,7 @@ Four facts that explain most of the confusion people hit:
 1. **Inbound is edge-triggered.** WeKit's `wait-for-new-message` MCP tool registers a WCDB listener *only for the duration of the call* and removes it in a `finally` block. There is no queue, no buffer, and no cursor. **Any WeChat message that arrives while the poll loop is not inside a wait call is lost permanently and cannot be recovered.** This is upstream WeKit behaviour, not a bug in this plugin, and there is no backfill in v0.1. See §6.
 2. **Plugin log records go to `agent.log`, not `gateway.log`.** See §8.
 3. **Transport instability is the single biggest source of "it works sometimes".** See §4.
-4. **If `WEKIT_BASE_URL` is unset the plugin does *not* fall back to something sensible.** It falls back to a legacy USB-bridge address — `http://<default gateway>:13001` on Linux, `http://127.0.0.1:13001` if the gateway can't be read. Set `WEKIT_BASE_URL` explicitly. See §2.
+4. **`WEKIT_BASE_URL` is required and has no default.** If it is unset the platform refuses to connect and says so in the log — it does not guess an address. See §2.
 
 Find your log first — every section below greps it:
 
@@ -84,7 +84,7 @@ Is the phone forwarded and WeKit API server on?
 
 `connect()` performs `GET /api/self/info` up to 4 times, 1.5 s apart, and refuses to bring the platform up unless one returns 200. Two things in that line are the discriminators — **the address it names** and **`<reason>`**. Read both.
 
-**If the address ends in `:13001`** and you never configured that, you forgot `WEKIT_BASE_URL`; the plugin fell back to its legacy USB-bridge default. Set the variable (§0, fact 4) and restart.
+**If instead of this line you see `WEKIT_BASE_URL is not set`**, that is the whole problem: the variable is required and the platform will not guess. Set it (§0, fact 4) and restart.
 
 ### How to confirm
 
@@ -246,7 +246,7 @@ Compare the two timeouts. The long-poll duration is yours to set; the HTTP read 
 grep -E '^WEKIT_POLL_TIMEOUT_MS=' ~/.hermes/.env      # your long-poll duration, ms
 ```
 
-In `connect()` the HTTP client is built as `httpx.Timeout(15.0, read=60.0)` — **60 s read timeout, hardcoded**, with 15 s for connect/write. Then time one poll by hand:
+In `connect()` the HTTP client is built as `httpx.Timeout(15.0, read=poll_timeout_ms/1000 + 15)`, so the read timeout always outlives the poll by 15 s and cannot be the cause here. (It could be in older revisions, which hardcoded `read=60.0`.) Then time one poll by hand:
 
 ```bash
 # 1) open an MCP session and capture the session id from the response headers
@@ -285,7 +285,7 @@ Two distinct ones — the timing tells them apart:
 
 ### Fix
 
-- Keep `WEKIT_POLL_TIMEOUT_MS` comfortably below 60000. The default is 30000; the reference deployment ran 55000 without trouble. Values under 5000 are clamped up to 5000, and an unparseable value falls back to 30000. If you want polls longer than 60 s you must also raise the hardcoded `read=60.0` in `connect()`.
+- `WEKIT_POLL_TIMEOUT_MS` is safe to raise: the HTTP read timeout is derived from it (poll + 15 s), so it can no longer be outrun by a longer poll. The default is 30000, which is what the reference deployment runs; 55000 was exercised during transport testing and completed intact. Values under 5000 are clamped up to 5000, and an unparseable value falls back to 30000.
 - For a severed-connection interval, fix the path (§4) rather than shortening the poll — a shorter poll means more gaps between waits, and every gap is deaf.
 
 ---

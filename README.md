@@ -151,7 +151,7 @@ Then restart the gateway and watch for `wechat-wekit: connected to …`, followe
 | Variable | Required | Meaning |
 |---|---|---|
 | `WEKIT_TOKEN` | **Yes** | Bearer token configured in WeKit's API + MCP server settings. Also gates `hermes gateway status` detection of this platform |
-| `WEKIT_BASE_URL` | Yes in practice | Where WeKit's API is reachable **from the agent host**, e.g. `http://192.168.1.50:3001`. If unset, the adapter falls back to a legacy USB-bridge address (`http://<default gateway>:13001`), which is almost certainly not what you want — set it explicitly |
+| `WEKIT_BASE_URL` | **Yes** | Where WeKit's API is reachable **from the agent host**, e.g. `http://192.168.1.50:3001`. There is deliberately no default: if it is unset the platform refuses to connect and tells you so, rather than guessing an address and leaving you with a confusing retry loop |
 | `WEKIT_ALLOWED_USERS` | Recommended | Comma-separated wxids allowed to talk to the agent. **Inbound filter only — outbound is unrestricted** |
 | `WEKIT_ALLOW_ALL_USERS` | No | `1` / `true` / `yes` (case-insensitive) disables the whitelist entirely. Unsafe: anyone who can message the account can drive your agent |
 | `WEKIT_POLL_TIMEOUT_MS` | No | Long-poll duration in ms. Default `30000`, values below `5000` are clamped up |

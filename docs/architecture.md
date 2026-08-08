@@ -101,7 +101,7 @@ POST /mcp   (with mcp-session-id)
            "arguments":{"timeout-ms": 30000}}}
 ```
 
-`timeout-ms` comes from `WEKIT_POLL_TIMEOUT_MS` (default `30000`, floored at `5000` by the adapter). The reference deployment runs a longer poll (~55 s) to reduce the number of re-arm gaps per hour; see §2.3 for why that number matters.
+`timeout-ms` comes from `WEKIT_POLL_TIMEOUT_MS` (default `30000`, floored at `5000` by the adapter). The reference deployment runs that default; 55 s polls were exercised during transport testing and completed intact, so raising it to cut the number of re-arm gaps per hour is reasonable. See §2.3 for why that number matters.
 
 The result is read from `result.content[0].text`. Three outcomes:
 
@@ -111,7 +111,7 @@ The result is read from `result.content[0].text`. Three outcomes:
 | matches `_WAIT_RE` (§5) | parsed into `{convId, sender, type, content}`, dispatched |
 | anything else | logged at debug (`unparsed wait result`), **treated as no message and dropped** |
 
-The httpx client is created with `timeout=httpx.Timeout(15.0, read=60.0)` — 15 s for connect/write/pool, 60 s for read. **If you raise `WEKIT_POLL_TIMEOUT_MS` to 60000 or beyond, the client-side read timeout fires before the server-side poll returns**, turning every poll into an exception-and-backoff cycle. Keep the poll timeout comfortably below 60 s (the reference deployment's 55 s is about the practical maximum).
+The httpx client is created with `timeout=httpx.Timeout(15.0, read=self.read_timeout_s)`, where `read_timeout_s` is derived in `__init__` as `poll_timeout_ms / 1000 + 15`. That coupling is deliberate: the long poll holds the response open for the whole poll window, so a read timeout shorter than the poll would abort **every** poll and kill inbound entirely. An earlier revision hardcoded `read=60.0` while leaving `WEKIT_POLL_TIMEOUT_MS` unbounded, which meant raising the poll past 60 s silently broke the channel. Deriving it removes the trap: raising the poll timeout is now safe.
 
 ### 2.3 Edge triggering — the central fact
 
@@ -466,7 +466,7 @@ Three further properties, all deliberate:
 | Variable | Required | Meaning |
 |---|---|---|
 | `WEKIT_TOKEN` | **yes** | Bearer token configured in WeKit's API + MCP server settings |
-| `WEKIT_BASE_URL` | yes in practice | e.g. `http://192.168.1.50:3001` — where the phone's WeKit API is reachable **from the agent host**. See §10 gap 8 for why the fallback default is not usable. |
+| `WEKIT_BASE_URL` | **yes** | e.g. `http://192.168.1.50:3001` — where the phone's WeKit API is reachable **from the agent host**. Required; there is no default (§10 gap 8). |
 | `WEKIT_ALLOWED_USERS` | recommended | comma-separated wxids allowed to talk to the agent (inbound filter only; outbound unrestricted) |
 | `WEKIT_ALLOW_ALL_USERS` | no | `true` disables the whitelist — unsafe, discovery use only |
 | `WEKIT_POLL_TIMEOUT_MS` | no | long-poll duration, default `30000`, floored at `5000`, must stay below the 60 s read timeout |
@@ -500,7 +500,7 @@ sender: content
 
 This is why the adapter contains **no content-based deduplication**. `wait-for-new-message` fires once per DB insert and never re-delivers, so dedup buys nothing on the live path — and deduping on text would wrongly swallow a user who genuinely repeats themselves. Any future backfill must own this problem explicitly rather than bolting on a text hash.
 
-**2. `_dedup()` / `_seen` / `_seen_order` are dead code.** Defined, never called. They are a leftover from an earlier design and should be removed or wired into a real backfill, not mistaken for working protection.
+**2. There is no deduplication layer.** An earlier revision carried `_dedup()` / `_seen` / `_seen_order`, defined but never called; that dead code has been removed rather than left to look like working protection. Deduplication is deliberately absent: `wait-for-new-message` fires once per DB insert, so it never re-delivers, and deduping on text would swallow a user who legitimately repeats themselves. A future backfill would have to introduce its own, more careful, scheme.
 
 **3. `message_id` is a wall-clock millisecond** (`str(int(time.time() * 1000))`), for both inbound events and `SendResult`. It is not the WeChat message id — WeKit does not give us one here — and it can collide under concurrency. Do not use it as a stable key.
 
@@ -512,7 +512,7 @@ This is why the adapter contains **no content-based deduplication**. `wait-for-n
 
 **7. No inbound media.** Images, voice, video and files arrive as placeholder text like `[image message]`; nothing is downloaded or shown to the agent. There is likewise no quoting/reply threading (`reply_to` is ignored) and no typing indicator.
 
-**8. The default `base_url` is a legacy value.** With `WEKIT_BASE_URL` unset, the adapter falls back to the agent host's default gateway (read from `/proc/net/route`, so on a non-Linux host it degrades to `127.0.0.1`) on port `13001` — an artefact of the deprecated USB-bridge topology (§7). **Always set `WEKIT_BASE_URL` explicitly.**
+**8. `base_url` has no default at all.** `WEKIT_BASE_URL` is required. With it unset, `connect()` logs what to set and returns `False` instead of guessing an address — a wrong guess produces a connect-retry loop that looks like a network fault rather than a missing setting. Earlier revisions did guess (the agent host's default gateway on port `13001`, an artefact of the USB-bridge topology in §7); that fallback has been removed.
 
 **9. Outbound success is judged by HTTP status only**, and outbound has no rate limiting of any kind. Nothing in this adapter protects you from tripping WeChat's own spam heuristics.
 
@@ -526,7 +526,7 @@ This is why the adapter contains **no content-based deduplication**. `wait-for-n
 
 ```
 connect()
-  ├─ create httpx.AsyncClient(timeout=15s, read=60s)
+  ├─ create httpx.AsyncClient(timeout=15s, read=poll+15s)
   ├─ GET /api/self/info  ×4 attempts, 1.5 s apart   ← cold-start tolerance
   │     └─ all fail → log the base_url + last error, close client, return False
   └─ spawn _poll_loop() task → return True
