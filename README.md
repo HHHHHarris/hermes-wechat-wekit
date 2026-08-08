@@ -156,7 +156,7 @@ Then restart the gateway and watch for `wechat-wekit: connected to …`, followe
 | `WEKIT_ALLOW_ALL_USERS` | No | `1` / `true` / `yes` (case-insensitive) disables the whitelist entirely. Unsafe: anyone who can message the account can drive your agent |
 | `WEKIT_POLL_TIMEOUT_MS` | No | Long-poll duration in ms. Default `30000`, values below `5000` are clamped up |
 | `WEKIT_HOME_CHANNEL` | No | convId that scheduled/cron deliveries are sent to |
-| `WEKIT_MEDIA_ADB_PATH` | No | Path to `adb`. Setting it turns on best-effort retrieval of received files and images off the phone (see below). Unset = disabled |
+| `WEKIT_MEDIA_ADB_PATH` | No | Path to `adb`. Setting it turns on retrieval of received files and images off the phone (see below). Unset = disabled |
 | `WEKIT_MEDIA_DIR` | No | Where retrieved media is written on the agent host. Default `/tmp/wekit-media` |
 | `WEKIT_ADB_SERIAL` / `WEKIT_ADB_PATH` / `WEKIT_LOG_PATH` | No | Device serial for media retrieval; the last two are used by the optional keepalive watchdog |
 | `WEKIT_ROUTER_WAN` / `WEKIT_PHONE_HOSTNAME` | No | Used by the router DNAT script only (its WAN-side address and the phone's DHCP hostname) |
@@ -231,7 +231,7 @@ Useful facts behind this design: WeKit's API+MCP server toggle **persists across
 | Inbound whitelist | ✅ | Matched against the conversation id **or** the sender id |
 | No echo loop | ✅ | WeKit does not report the agent's own outgoing messages |
 | Receive non-text (image/voice/file/link/sticker/location/quote) | ✅ | Every payload is decoded into a short, actionable line — filename and size for files, duration for voice, the actual URL for links, the quoted text for replies. The raw XML never reaches the model |
-| Receive the media *itself* | ⚠️ Best-effort | See [Receiving files and images](#receiving-files-and-images). Requires adb access to the phone, and the media must already be downloaded there |
+| Receive the media *itself* | ✅ | Files, voice notes and images are fetched off the phone and handed to the agent as real local files (`media_urls`), so it can open and read them. Needs the companion WeKit script — see [Receiving the actual files](#receiving-the-actual-files) |
 | Chat history / backfill | ❌ Not used | WeKit exposes conversation history endpoints; this plugin never reads them. See below |
 | Quote / reply threading | ❌ | `reply_to` is accepted and ignored — replies are ordinary messages, not WeChat quotes |
 | Typing indicator | ❌ | `send_typing` is a no-op |
@@ -288,6 +288,61 @@ If you want this to be reliable rather than best-effort, the fix belongs
 upstream: `wait-for-new-message` already holds `msgSvrId` in the row it reads
 and would only need to include it in the response, after which the documented
 `download-file` / `download-image` endpoints would do the job properly.
+
+## Receiving the actual files
+
+Out of the box this plugin can *describe* an incoming file but not open it, and
+the reason is worth stating plainly: **WeKit's download endpoints are all keyed
+by `msgSvrId`, and no WeKit API ever returns one.** `wait-for-new-message` gives
+ConvId/Sender/Type/Content; `get-chat-history` gives sender/content. The id
+needed to fetch an attachment is simply never exposed.
+
+`phone-script/hermes-media-bridge.js` closes that gap from inside WeChat,
+without patching WeKit. WeKit ships a JavaScript engine that can hook arbitrary
+methods, so the script hooks the same WCDB insert WeKit itself hooks, reads
+`msgSvrId` straight off the `ContentValues`, and calls WeKit's own local API to
+download the attachment into `/sdcard/Download/WeKit/`. The plugin then pulls it
+to the agent host over adb and passes the local path in `media_urls`.
+
+### Install
+
+```bash
+adb push phone-script/hermes-media-bridge.js \
+  /sdcard/Android/data/com.tencent.mm/WeKit/scripts_js/
+```
+
+Edit `TOKEN` at the top of the script to match your WeKit API token, then enable
+**脚本引擎 (JS)** in WeKit (Features → search `javascript`). Enabling it loads
+the script immediately — no WeChat restart. Finally, point the plugin at adb:
+
+```bash
+WEKIT_MEDIA_ADB_PATH=/path/to/adb
+WEKIT_ADB_SERIAL=<serial>        # optional with a single device
+WEKIT_MEDIA_DIR=/var/lib/hermes/wechat-media
+```
+
+### Things that will bite you
+
+- **Editing the script does not reload it.** Toggle the JS feature off and on;
+  the log line `loaded script, name=...` confirms the new copy is live.
+- **`msgSvrId` must be read as a string.** It exceeds 2^53, so reading it as a
+  JavaScript number silently rounds it and the download then asks for an id that
+  does not exist. The script uses `getAsString` / `Cursor.getString`.
+- **Never do network I/O in the hook.** It runs on WeChat's database thread;
+  downloading a large attachment there would freeze the app. The script queues
+  the id and lets a worker thread fetch it.
+- **Messages you send yourself have no `msgSvrId` at insert time** (the server
+  assigns it on send), so self-sent messages cannot be used to test the path.
+- The script also backfills: on startup it queues recently received media that
+  arrived before it was installed.
+
+### What is not retrievable
+
+Official-account articles. Fetching `mp.weixin.qq.com` from anywhere but a real
+WeChat client redirects to a captcha page ("环境异常"), and WeKit's WebView
+tracking only sees the main process — articles open in WeChat's separate
+`:tools` process, so its `webview-eval-js` tool cannot reach them either.
+
 
 ## Known limitations
 

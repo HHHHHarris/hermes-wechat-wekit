@@ -288,11 +288,22 @@ class PhoneMediaFetcher:
     # recovered from any known magic byte.
     _MAGIC = ((0xFF, 0xD8, 0xFF), (0x89, 0x50, 0x4E), (0x47, 0x49, 0x46))
 
-    def __init__(self, adb_path: str, serial: str, dest_dir: str, window_s: int = 180):
+    def __init__(self, adb_path: str, serial: str, dest_dir: str, window_s: int = 180,
+                 wait_for_download_s: float = 45.0):
         self.adb_path = adb_path
         self.serial = serial
         self.dest_dir = dest_dir
         self.window_s = window_s
+        self.wait_for_download_s = wait_for_download_s
+
+    async def _size_is_stable(self, remote: str) -> bool:
+        """True once two readings a second apart agree — i.e. the download finished."""
+        first = await self._su(f"stat -c %s {shlex.quote(remote)} 2>/dev/null")
+        if not first.strip():
+            return False
+        await asyncio.sleep(1.0)
+        second = await self._su(f"stat -c %s {shlex.quote(remote)} 2>/dev/null")
+        return first.strip() == second.strip() and second.strip() not in ("", "0")
 
     @classmethod
     def from_env(cls) -> PhoneMediaFetcher | None:
@@ -346,7 +357,33 @@ class PhoneMediaFetcher:
         rc, out = await self._adb("shell", f"su -c {shlex.quote(script)}", timeout=timeout)
         return out.decode("utf-8", "replace").replace("\r", "") if rc == 0 else ""
 
+    # Where the companion WeKit script drops what it downloads. Public storage,
+    # so it can be pulled without root.
+    WEKIT_DOWNLOAD_DIR = "/sdcard/Download/WeKit"
+
     async def _locate_file(self, filename: str) -> str:
+        # Prefer the companion script's download folder: a file there was
+        # fetched deliberately for this message, whereas a name match elsewhere
+        # in WeChat's storage could be any older copy.
+        #
+        # Poll for a while rather than looking once: the companion script only
+        # learns about the message at the same moment we do, and then has to
+        # pull it from WeChat's CDN — a large attachment is simply not on disk
+        # yet when the first inbound event reaches us.
+        deadline = time.monotonic() + self.wait_for_download_s
+        while True:
+            listing = await self._su(
+                f"find {self.WEKIT_DOWNLOAD_DIR} -type f -name {shlex.quote(filename)} "
+                "2>/dev/null | head -1"
+            )
+            if listing.strip():
+                path = listing.strip().splitlines()[0].strip()
+                # Wait for the size to settle so a partial file is never sent on.
+                if await self._size_is_stable(path):
+                    return path
+            if time.monotonic() >= deadline:
+                break
+            await asyncio.sleep(2.0)
         listing = await self._su(
             "find /data/data/com.tencent.mm /sdcard/Android/data/com.tencent.mm "
             f"-type f -name {shlex.quote(filename)} 2>/dev/null | head -1"
@@ -354,6 +391,16 @@ class PhoneMediaFetcher:
         return listing.strip().splitlines()[0].strip() if listing.strip() else ""
 
     async def _locate_recent_image(self) -> str:
+        # Same preference as _locate_file: anything the companion script pulled
+        # down is a deliberate fetch for a just-received message.
+        recent = await self._su(
+            f"find {self.WEKIT_DOWNLOAD_DIR} -type f "
+            f"-mmin -{max(1, self.window_s // 60)} 2>/dev/null | head -5"
+        )
+        picked = [p.strip() for p in recent.splitlines() if p.strip()]
+        if picked:
+            return picked[0]
+
         # Newest image written inside the window, preferring a full image over a
         # thumbnail (WeChat names thumbnails th_*).
         script = (
