@@ -340,22 +340,36 @@ WEKIT_MEDIA_DIR=/var/lib/hermes/wechat-media
 ### Official-account articles
 
 An article link cannot be fetched by the agent, and that is not a proxy or
-network problem: `mp.weixin.qq.com` serves the page only to a real WeChat
-client and redirects everything else to a captcha ("环境异常"). Reading it out
-of the app programmatically does not work either — the article renders in
-WeChat's separate `:tools` process, which WeKit's WebView tracking does not
-reach, and WebView text never enters the accessibility tree (a UI dump of an
-open article comes back empty), so there is no DOM to query.
+network problem: `mp.weixin.qq.com` serves the page only to a real WeChat client
+and redirects everything else to a captcha ("环境异常"), identically from any
+machine or network.
 
-What does work is the screen. The article renders normally and is not
-FLAG_SECURE. With `WEKIT_CAPTURE_ARTICLES=true`, a link message causes the
-phone to open the article, scroll through it, and capture each screen; the
-images are attached to the message so the agent reads them the way it reads any
-other picture. Capture stops when the screen stops changing, and the phone is
-returned to its home screen afterwards.
+With `WEKIT_CAPTURE_ARTICLES=true` the article is instead **read off the phone
+as text**. The article renders in the *system* Chromium WebView, which builds an
+Android accessibility tree — but only while an accessibility service is running,
+which is why a UI dump of an open article otherwise comes back as one empty
+node. The plugin therefore enables Select-to-Speak (preinstalled on stock
+Android; silent and non-intrusive when merely enabled), loads the article,
+reads and scrolls until nothing new appears, strips WeChat's chrome and the
+trailing ad block, and **restores the accessibility setting to exactly what it
+was**. A 5,000-word article comes back as ~5,500 characters of clean text in
+about a minute.
 
-It takes over the phone's display for a few seconds per article, which is why
-it is off by default. Set it only on a phone dedicated to the agent.
+If the text path yields nothing, it falls back to scrolling screenshots
+attached as images.
+
+Two things worth knowing: the accessibility service must be enabled *before* the
+page loads (an already-rendered WebView will not grow a tree), and this takes
+over the phone's display while it runs — which is why it is off by default. Use
+it on a phone dedicated to the agent.
+
+Paths that were tried and do not work, so they need not be retried: WeKit's
+`webview-eval-js` (it is a WeAgent tool, not exposed on the MCP port, and its
+tracker only sees the main process while articles render in `:tools`); the CGI
+interception hooks (`onResponse`/cgiId 21909) — modern WeChat loads the article
+body over WebView HTTP, not that protobuf channel, and a probe hooked to it
+never fires; and remote debugging (no devtools socket is open in a release
+build).
 
 
 ## Known limitations

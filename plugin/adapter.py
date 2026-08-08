@@ -34,6 +34,7 @@ import asyncio
 import contextlib
 import datetime
 import hashlib
+import html
 import logging
 import os
 import re
@@ -498,9 +499,115 @@ class PhoneMediaFetcher:
     ARTICLE_HOSTS = ("mp.weixin.qq.com",)
     _ARTICLE_ACTIVITY = "com.tencent.mm/.plugin.webview.ui.tools.WebViewUI"
 
+    # Chromium only builds an Android accessibility tree for its WebView while
+    # an accessibility service is running; without one, a UI dump of an open
+    # article is a single empty node. Select-to-Speak is used because it is
+    # preinstalled on stock Android, and unlike TalkBack it neither speaks nor
+    # takes over touch exploration while merely enabled.
+    _A11Y_SERVICE = ("com.google.android.marvin.talkback/"
+                     "com.google.android.accessibility.selecttospeak."
+                     "SelectToSpeakService")
+
+    # Trailing junk: WeChat appends ad slots and navigation after the article.
+    _ARTICLE_STOP_MARKERS = ("广告", "上一篇", "下一篇", "轻点两下取消赞",
+                             "写留言", "暂无留言")
+    _ARTICLE_DROP = re.compile(
+        r"^(Follow|muted_icon|arrow_\w+|了解更多|立即咨询|点击了解更多|"
+        r"[0-9a-f]{24,}.*|听全文|Original|轻触阅读原文)$")
+
     @classmethod
     def is_article(cls, url: str) -> bool:
         return bool(url) and any(h in url for h in cls.ARTICLE_HOSTS)
+
+    async def _set_accessibility(self, on: bool) -> None:
+        """Toggle the accessibility service the WebView tree depends on."""
+        if on:
+            await self._su("settings put secure enabled_accessibility_services "
+                           f"{self._A11Y_SERVICE}")
+            await self._su("settings put secure accessibility_enabled 1")
+        else:
+            await self._su("settings delete secure enabled_accessibility_services")
+            await self._su("settings put secure accessibility_enabled 0")
+
+    async def _dump_text(self) -> list[str]:
+        """Visible text of the current screen, via the accessibility tree."""
+        remote = "/sdcard/wekit-uidump.xml"
+        rc, _ = await self._adb("shell", f"uiautomator dump {remote}", timeout=60)
+        if rc != 0:
+            return []
+        rc, xml = await self._adb("shell", f"cat {remote}", timeout=40)
+        if rc != 0 or not xml:
+            return []
+        out = []
+        for raw in re.findall(rb'text="([^"]{2,})"', xml):
+            t = html.unescape(raw.decode("utf-8", "replace")).strip()
+            if t:
+                out.append(t)
+        return out
+
+    async def read_article(self, url: str, max_pages: int = 25) -> str:
+        """Open an article on the phone and return its text.
+
+        The article cannot be fetched from off-device — WeChat serves it only to
+        its own client — and its WebView lives in a process WeKit's tooling does
+        not reach. But it is the *system* Chromium WebView, which does expose an
+        accessibility tree, so with an accessibility service running the text can
+        simply be read off the screen as it is scrolled.
+        """
+        collected: list[str] = []
+        seen: set[str] = set()
+        # Note what was there first so the phone is left exactly as found.
+        # `settings get` prints the literal string "null" when unset, which is
+        # truthy — comparing against it explicitly is what makes the restore
+        # correct rather than leaving the service switched on.
+        prior = (await self._su(
+            "settings get secure enabled_accessibility_services")).strip()
+        had_service = prior not in ("", "null")
+        try:
+            if not had_service:
+                await self._set_accessibility(True)
+                await asyncio.sleep(2.0)
+
+            await self._su("input keyevent KEYCODE_WAKEUP")
+            await self._su("wm dismiss-keyguard")
+            # Load after enabling the service: an already-rendered page has no
+            # accessibility tree and will not grow one.
+            await self._su(f"am start -n {self._ARTICLE_ACTIVITY} "
+                           f"-e rawUrl {shlex.quote(url)}")
+            await asyncio.sleep(8.0)
+
+            stalled = 0
+            for _ in range(max_pages):
+                fresh = [t for t in await self._dump_text() if t not in seen]
+                for t in fresh:
+                    seen.add(t)
+                    collected.append(t)
+                # Two scrolls that reveal nothing new means the end.
+                stalled = stalled + 1 if not fresh else 0
+                if stalled >= 2:
+                    break
+                await self._su("input swipe 500 1650 500 500 350")
+                await asyncio.sleep(1.2)
+        except Exception:
+            logger.debug("wechat-wekit: article read failed", exc_info=True)
+        finally:
+            with contextlib.suppress(Exception):
+                await self._su("input keyevent KEYCODE_HOME")
+                if not had_service:
+                    await self._set_accessibility(False)
+        return self._clean_article(collected)
+
+    @classmethod
+    def _clean_article(cls, lines: list[str]) -> str:
+        """Drop WeChat's chrome and the ad block that follows the article."""
+        kept = []
+        for t in lines:
+            if any(m in t for m in cls._ARTICLE_STOP_MARKERS):
+                break
+            if cls._ARTICLE_DROP.match(t):
+                continue
+            kept.append(t)
+        return "\n".join(kept).strip()
 
     async def capture_article(self, url: str, max_pages: int = 12) -> list[str]:
         """Open an article on the phone and return screenshots of it.
@@ -835,16 +942,23 @@ class WeKitAdapter(BasePlatformAdapter):
                 logger.info("wechat-wekit: fetched %s from phone -> %s", kind, local)
         elif self._media and self._capture_articles and \
                 self._media.is_article(meta.get("url", "")):
-            # The agent cannot open this link itself — see capture_article.
-            shots = await self._media.capture_article(meta["url"])
-            if shots:
-                media_urls = shots
-                media_types = ["photo"] * len(shots)
-                text += (f"\n(The agent cannot fetch this link directly — WeChat "
-                         f"only serves it to its own client. It was opened on the "
-                         f"phone and captured as {len(shots)} screenshot(s), "
-                         f"attached above in reading order.)")
-                logger.info("wechat-wekit: captured article in %d screenshot(s)", len(shots))
+            # The agent cannot fetch this link itself — WeChat serves articles
+            # only to its own client. Read it off the phone instead: text if the
+            # accessibility tree gives it up, screenshots as a fallback.
+            body = await self._media.read_article(meta["url"])
+            if body:
+                text += f"\n\n--- article text (read on the phone) ---\n{body}"
+                logger.info("wechat-wekit: read article text (%d chars)", len(body))
+            else:
+                shots = await self._media.capture_article(meta["url"])
+                if shots:
+                    media_urls = shots
+                    media_types = ["photo"] * len(shots)
+                    text += (f"\n(Could not read the article as text; it was "
+                             f"opened on the phone and captured as {len(shots)} "
+                             f"screenshot(s), attached in reading order.)")
+                    logger.info("wechat-wekit: captured article in %d screenshot(s)",
+                                len(shots))
 
         name = await self._contact_name(conv_id) or conv_id
         source = self.build_source(
