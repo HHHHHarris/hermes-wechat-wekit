@@ -298,6 +298,14 @@ logged and ignored, never treated as "allow everyone" — a lookup failure must
 not silently open the account up. Membership is read once at connect, so a
 contact added to the label afterwards takes effect at the next reconnect.
 
+**Create the label in WeChat first** (Me → Contacts → Tags). WeKit can read
+labels and assign existing ones, but has no endpoint for creating one — WeChat
+does that over a separate CGI that is not on the REST surface. Assigning a name
+that does not exist used to look like it worked (WeChat skips the unknown name
+and still answers 200); `wechat_labels` now checks the name against the label
+list and fails with the labels that do exist, rather than reporting a write that
+did nothing.
+
 ## Receiving files and images
 
 Every incoming message type is decoded into a short line the agent can act on,
