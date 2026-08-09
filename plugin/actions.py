@@ -1,4 +1,37 @@
-"""WeKit action helpers and the Hermes agent tools built on top of them.
+"""WeKit 动作封装, 以及构建在其上的 Hermes agent 工具.
+
+``adapter.py`` 里的平台适配器管的是消息流本身: 轮询收信, 渲染, 回复. 本模块管
+的是一次对话可能用得上的其余所有 WeKit HTTP API 能力: 拉聊天记录, 重新拉取微信
+没有下载过的图片, 发原生语音气泡, 管群成员, 发朋友圈, 读联系人标签.
+
+这里有两层, 是刻意分开的:
+
+* :class:`WeKitActions` 是对 WeKit REST 端点 (``http://<phone>:3001/api/...``)
+  的一层薄异步封装, 不依赖 Hermes. 它不 import agent 运行时的任何东西, 所以能
+  对着 mock 出来的 ``httpx`` client 做单元测试, 适配器自己也复用它 (比如把一个
+  标签解析成白名单).
+
+* 工具层是 JSON schema, handler 和 :func:`register_tools`, 把这些动作接进
+  Hermes, 变成 ``hermes-wechat-wekit`` toolset 里 agent 可调用的工具. 这个名字
+  是要紧的: 对插件平台, Hermes 按 ``hermes-{platform_key}`` 推导默认 toolset,
+  所以拿平台名来命名, 才能一行配置都不用改就在微信会话里生效.
+
+  注意它不是只在微信会话里生效. Hermes 把不认识的插件 toolset 一律当作处处默认
+  开启, 所以 CLI 或 Telegram 会话同样拿得到这些工具, 除非运维用 ``hermes tools``
+  另行关掉. 这通常正是你要的效果 (从 CLI 操作微信很有用), 但它意味着信任边界是
+  下面那道写操作开关, 而不是你此刻所在的平台.
+
+安全
+----
+发消息 (文字, 语音, 视频) 的风险并不比 agent 本来就会发的那条回复更高, 所以这
+类工具始终可用. 会改动账号社交关系, 或者对别人可见的动作, 也就是通过好友申请,
+加/踢/邀请群成员, 发朋友圈, 全部由 ``WEKIT_ENABLE_WRITE_ACTIONS`` 把关. 开关关
+着时 (默认如此) 这些工具照样出现, 但会拒绝执行并说明怎么打开, 这样模型就没法悄
+无声息地重塑这个账号. 用自动化操作个人微信号违反其服务条款, 请专门开小号用.
+
+--- English original ---
+
+WeKit action helpers and the Hermes agent tools built on top of them.
 
 The platform adapter in ``adapter.py`` is about the message *stream* — poll for
 inbound, render it, send a reply.  This module is about everything else WeKit's
@@ -52,7 +85,12 @@ import httpx
 
 
 def _load_file(path: str, default_mime: str) -> tuple[str, str, bytes]:
-    """Read a local file into (basename, mime, bytes).
+    """把一个本地文件读成 (basename, mime, bytes).
+
+    这是阻塞调用, 一律用 ``asyncio.to_thread`` 包起来, 别让文件 I/O 跑在收信轮
+    询共用的那个事件循环上.
+
+    Read a local file into (basename, mime, bytes).
 
     Blocking — call via ``asyncio.to_thread`` so file I/O never runs on the
     event loop the inbound poll shares.
@@ -69,6 +107,9 @@ def _safe_unlink(path: str) -> None:
     with contextlib.suppress(OSError):
         os.remove(path)
 
+# tool_result / tool_error 来自 Hermes 运行时. 在运行时之外 import 本模块时
+# (测试, 单独使用) 回退到行为兼容的本地替身, 这样没装 agent 也照样 import 得动.
+#
 # tool_result / tool_error live in the Hermes runtime.  Fall back to compatible
 # local shims when imported outside it (tests, standalone use) so this module
 # stays importable without the agent installed.
@@ -86,15 +127,23 @@ except Exception:  # pragma: no cover
         return _json.dumps(out, ensure_ascii=False)
 
 
-# ── the REST wrapper ──────────────────────────────────────────────────────
+# ── REST 封装 / the REST wrapper ──────────────────────────────────────────
 
 
 class WeKitActionError(RuntimeError):
-    """A WeKit endpoint returned an error or unreachable response."""
+    """WeKit 的某个端点返回了错误, 或者根本连不上.
+
+    A WeKit endpoint returned an error or unreachable response.
+    """
 
 
 class WeKitActions:
-    """Async wrapper over the WeKit ``/api`` surface.
+    """对 WeKit ``/api`` 这一整组接口的异步封装.
+
+    传入一个现成的 ``httpx.AsyncClient`` 就能复用适配器的连接; 不传的话, 每次
+    调用各自开一个短命 client, 用完即关 (一次性的工具 handler 用这个就够了).
+
+    Async wrapper over the WeKit ``/api`` surface.
 
     Pass an existing ``httpx.AsyncClient`` to reuse the adapter's connection;
     omit it and each call opens and closes its own short-lived client (fine for
@@ -114,7 +163,7 @@ class WeKitActions:
         self._client = client
         self._timeout = timeout
 
-    # -- plumbing ----------------------------------------------------------
+    # -- 底层管道 / plumbing -----------------------------------------------
 
     def _headers(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {self.token}"}
@@ -141,6 +190,10 @@ class WeKitActions:
                 json=json_body,
                 files=files,
                 data=data,
+                # 借来的 client 带的是适配器的 timeout, 那个值由 long poll
+                # 的窗口推导出来, 可能长达几分钟. 这里都是普通的短请求, 所以
+                # 自己定一个上界, 不去继承那个给轮询用的.
+                #
                 # A borrowed client carries the adapter's timeout, which is
                 # derived from the long-poll window and can be minutes. These
                 # are ordinary short requests, so they get their own bound
@@ -171,6 +224,11 @@ class WeKitActions:
         except ValueError:
             return text
 
+        # 200 不等于"这事成了". WeKit 有一部分失败是拿 HTTP 200 配上
+        # {"success": false, "error": ...} 回给你的, mp3→SILK 转换在缺 ffmpeg
+        # 时就正是这么干的, 而调用方会接着去发一条语音消息, 指向一个根本没被写
+        # 出来的文件. 所以一律以 body 为准, 免得每个 action 都得自己记着这件事.
+        #
         # A 200 is not the same as "it worked". WeKit answers some failures with
         # HTTP 200 and {"success": false, "error": ...} — the mp3→SILK converter
         # does exactly that when ffmpeg is missing, and the caller would go on to
@@ -184,7 +242,10 @@ class WeKitActions:
         return parsed
 
     async def _upload(self, local_path: str) -> str:
-        """Push a local file to the phone; return the path WeKit saved it under."""
+        """把本地文件推到手机上, 返回 WeKit 保存它时用的路径.
+
+        Push a local file to the phone; return the path WeKit saved it under.
+        """
         name, mime, payload = await asyncio.to_thread(
             _load_file, local_path, "application/octet-stream"
         )
@@ -198,10 +259,16 @@ class WeKitActions:
             raise WeKitActionError(f"media/upload returned no path: {res!r}")
         return path
 
-    # -- feature 1: history (ChatLab) --------------------------------------
+    # -- 功能 1: 聊天记录 / feature 1: history (ChatLab) -------------------
 
     async def pull_history(self, conv_id: str, count: int = 50) -> list[dict]:
-        """Return up to ``count`` recent messages for a conversation, oldest first.
+        """返回某个会话最近的至多 ``count`` 条消息, 最旧的在前.
+
+        WeKit 的历史接口按页取, 并且会把群里的发送者解析成名字; 每条消息只给
+        ``{sender, content, type}`` (没有时间戳, 也没有服务端 id), 所以这里一
+        直往前翻页, 攒够为止, 再按阅读顺序把这一段交回去.
+
+        Return up to ``count`` recent messages for a conversation, oldest first.
 
         WeKit's history endpoint is page-based and resolves group senders to
         names; it returns only ``{sender, content, type}`` per message (no
@@ -222,6 +289,11 @@ class WeKitActions:
             if not isinstance(batch, list) or not batch:
                 break
 
+            # 服务端把同一页又还回来一次就停: 端点无视 `page-index` 时就长这
+            # 个样, 继续翻只会往历史里灌重复内容, 而模型会把它当成真发生过的
+            # 对话来读. 这里刻意拿整页跟整页比, 而不是对消息去重: 一个人连说
+            # 两次 "ok" 不是重复.
+            #
             # Stop if the server handed back the same page again — that is what
             # an endpoint ignoring `page-index` looks like, and continuing would
             # pad the history with repetition the model reads as real.
@@ -236,13 +308,19 @@ class WeKitActions:
                 break
             page += 1
         collected = collected[:count]
+        # 端点返回的是最新在前, 这里翻成时间正序
         collected.reverse()  # endpoint returns newest-first; make it chronological
         return collected
 
-    # -- feature 2: re-fetch media from CDN --------------------------------
+    # -- 功能 2: 从 CDN 重拉媒体 / feature 2: re-fetch media from CDN ------
 
     async def cache_image(self, msg_svr_id: int | str) -> str:
-        """Force WeChat to pull an image from the CDN into its own cache.
+        """让微信把一张图片从 CDN 拉进它自己的缓存.
+
+        补的是这个缺口: 收到的图片如果微信从没自动下载过, 本地就没有字节可取.
+        返回缓存后的路径; 接着 GET ``messages/{id}/image`` 就能把它读出来.
+
+        Force WeChat to pull an image from the CDN into its own cache.
 
         Fixes the gap where a received image WeChat never auto-downloaded has no
         local bytes to fetch.  Returns the cached path; follow with a GET of
@@ -262,7 +340,7 @@ class WeKitActions:
             return res.get("path") or ""
         return str(res or "")
 
-    # -- feature 3: native voice bubble ------------------------------------
+    # -- 功能 3: 原生语音气泡 / feature 3: native voice bubble -------------
 
     async def audio_duration(self, phone_path: str) -> int:
         res = await self._request(
@@ -284,7 +362,12 @@ class WeKitActions:
         *,
         duration_ms: int | None = None,
     ) -> dict:
-        """Send a local mp3 as a native WeChat voice bubble.
+        """把一个本地 mp3 发成微信的原生语音气泡.
+
+        先上传 mp3, 在手机上转成 SILK (微信的语音格式), 读出时长, 再走语音那
+        条路径发出去.
+
+        Send a local mp3 as a native WeChat voice bubble.
 
         Uploads the mp3, converts it to SILK on the phone (WeChat's voice
         format), reads its duration, and sends it down the voice path.
@@ -304,7 +387,7 @@ class WeKitActions:
         )
         return {"ok": True, "durationMs": int(dur)}
 
-    # -- feature 4: groups + friends ---------------------------------------
+    # -- 功能 4: 群 + 好友 / feature 4: groups + friends -------------------
 
     async def list_group_members(self, group_id: str) -> list[dict]:
         res = await self._request("GET", f"groups/{group_id}/members")
@@ -313,7 +396,10 @@ class WeKitActions:
     async def group_member_op(
         self, group_id: str, op: str, member_wxids: list[str]
     ) -> dict:
-        """op ∈ {add, delete, invite}; ``member_wxids`` is one or more wxIds."""
+        """op ∈ {add, delete, invite}; ``member_wxids`` 是一个或多个 wxId.
+
+        op ∈ {add, delete, invite}; ``member_wxids`` is one or more wxIds.
+        """
         if op not in ("add", "delete", "invite"):
             raise WeKitActionError(f"unknown group op: {op}")
         member_wxids = [w for w in member_wxids if w]
@@ -336,7 +422,7 @@ class WeKitActions:
         await self._request("POST", "contacts/verify", json_body=body)
         return {"ok": True, "userId": user_id}
 
-    # -- feature 5: Moments + video ----------------------------------------
+    # -- 功能 5: 朋友圈 + 视频 / feature 5: Moments + video ----------------
 
     async def post_moment_text(self, content: str) -> dict:
         await self._request("POST", "moments/text", json_body={"content": content})
@@ -364,13 +450,17 @@ class WeKitActions:
         )
         return {"ok": True}
 
-    # -- feature 6: contact labels -----------------------------------------
+    # -- 功能 6: 联系人标签 / feature 6: contact labels --------------------
 
     async def list_labels(self) -> list[dict]:
         res = await self._request("GET", "labels")
         return res if isinstance(res, list) else []
 
     async def contacts_by_label(self, label_id_or_name: str) -> list[str]:
+        # 标签名是人在手机上随手打的自由文本: 中文, 空格, 偶尔还带斜杠. 不转
+        # 义的话, 像 "work/home" 这样的名字会改变请求的路径结构, 而不是老老实
+        # 实待在一个路径段里.
+        #
         # Label names are free text a person typed on their phone — Chinese,
         # spaces, and occasionally a slash. Unescaped, a name like "work/home"
         # would change the request's path shape rather than be one segment.
@@ -379,7 +469,14 @@ class WeKitActions:
         return [str(x) for x in res] if isinstance(res, list) else []
 
     async def set_contact_labels(self, wx_id: str, labels: list[str]) -> dict:
-        """Replace a contact's label set.
+        """整组替换一个联系人的标签.
+
+        微信只认已经存在的标签: 在 WeKit 内部, 一个解析不出 id 的名字会被跳过,
+        只留一行日志, 端点照样返回 200, 于是一个不存在的名字看上去像是成功了,
+        实际什么都没做. 所以这里先拿标签列表核对名字, 名字不存在就报错, 而不是
+        静默地什么也不干. WeKit 没有暴露创建标签的接口, 新标签只能去微信里建.
+
+        Replace a contact's label set.
 
         WeChat only accepts labels that already exist: inside WeKit, a name it
         cannot resolve to an id is skipped with a log line, and the endpoint
@@ -405,7 +502,7 @@ class WeKitActions:
         return {"ok": True, "wxId": wx_id, "labels": labels}
 
 
-# ── env / gating helpers ───────────────────────────────────────────────────
+# ── 环境与开关辅助 / env / gating helpers ─────────────────────────────────
 
 
 def _actions_from_env() -> WeKitActions | None:
@@ -435,14 +532,18 @@ _WRITE_GATE_MSG = (
 
 
 async def _edge_tts_to_mp3(text: str, voice: str, out_path: str) -> None:
-    """Render text to an mp3 with edge-tts (optional dependency)."""
+    """用 edge-tts 把文本合成为 mp3 (可选依赖).
+
+    Render text to an mp3 with edge-tts (optional dependency).
+    """
+    # 延迟导入, 这样没装 edge-tts 也照样能加载本模块
     import edge_tts  # imported lazily so the module loads without it
 
     communicate = edge_tts.Communicate(text, voice)
     await communicate.save(out_path)
 
 
-# ── tool schemas ──────────────────────────────────────────────────────────
+# ── 工具 schema / tool schemas ────────────────────────────────────────────
 
 _CONV = {"type": "string", "description": "WeChat conversation id: a wxid for a "
          "person, or a ...@chatroom id for a group."}
@@ -586,7 +687,7 @@ LABELS_SCHEMA = {
 }
 
 
-# ── tool handlers ─────────────────────────────────────────────────────────
+# ── 工具 handler / tool handlers ──────────────────────────────────────────
 
 
 async def _handle_pull_history(args: dict, **_kw: Any) -> str:
@@ -618,13 +719,17 @@ async def _handle_send_voice(args: dict, **_kw: Any) -> str:
             if not text:
                 return tool_error("Provide either text or audio_path.")
             voice = (args.get("voice") or "zh-CN-XiaoxiaoNeural").strip()
+            # 每次调用都取一个唯一的文件名: 同时发出去的两条语音不能互相盖掉
+            # 对方的音频, 而按文本内容派生文件名, 在同一句话发两遍时恰好就会
+            # 盖掉.
+            #
             # A unique name per call: two voice messages sent at once must not
             # write over each other's audio, and a name derived from the text
             # would do exactly that when the same line is sent twice.
             fd, tmp_created = await asyncio.to_thread(
                 tempfile.mkstemp, prefix="wekit-tts-", suffix=".mp3"
             )
-            os.close(fd)  # edge-tts writes the path itself
+            os.close(fd)  # edge-tts 自己按路径写文件 / edge-tts writes the path itself
             try:
                 await _edge_tts_to_mp3(text, voice, tmp_created)
             except ImportError:
@@ -746,7 +851,7 @@ async def _handle_labels(args: dict, **_kw: Any) -> str:
         return tool_error(str(exc))
 
 
-# name, schema, handler, emoji
+# 名称, schema, handler, emoji / name, schema, handler, emoji
 _TOOLS = (
     ("wechat_pull_history", PULL_HISTORY_SCHEMA, _handle_pull_history, "📜"),
     ("wechat_send_voice", SEND_VOICE_SCHEMA, _handle_send_voice, "🎙️"),
@@ -761,7 +866,10 @@ TOOLSET = "hermes-wechat-wekit"
 
 
 def register_tools(ctx: Any) -> None:
-    """Register the WeChat action tools. Called from the plugin's register()."""
+    """注册这些微信动作工具. 由插件的 register() 调用.
+
+    Register the WeChat action tools. Called from the plugin's register().
+    """
     for name, schema, handler, emoji in _TOOLS:
         ctx.register_tool(
             name=name,

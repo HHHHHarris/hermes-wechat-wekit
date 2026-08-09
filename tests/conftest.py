@@ -1,4 +1,10 @@
-"""Stub out the Hermes runtime so the adapter can be unit-tested standalone.
+"""把 Hermes 运行时打桩, 让 adapter 可以脱离 Hermes 单独做单元测试.
+
+adapter 会从 Hermes agent 里 import `gateway.platforms.base` 和 `gateway.config`.
+与其要求 CI 装一整套 Hermes, 不如在 import adapter 之前先注册几个最小替身. 这些替身
+只要能让 import 通过、让类继承关系对得上就够了, 这里没有任何测试会真的去跑 Hermes 的行为.
+
+Stub out the Hermes runtime so the adapter can be unit-tested standalone.
 
 The adapter imports `gateway.platforms.base` and `gateway.config` from the
 Hermes agent. Rather than requiring a full Hermes install in CI, we register
@@ -27,6 +33,7 @@ class _SendResult:
 
 
 class _MessageType(str, Enum):
+    # 对应 gateway.platforms.base.MessageType, 要跟 Hermes 那边保持同步.
     # Mirrors gateway.platforms.base.MessageType — keep in step with Hermes.
     TEXT = "text"
     LOCATION = "location"
