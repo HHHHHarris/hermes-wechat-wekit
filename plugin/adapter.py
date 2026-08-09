@@ -41,7 +41,7 @@ import shlex
 import struct
 import time
 import zlib
-from typing import Any
+from typing import Any, ClassVar
 from xml.etree import ElementTree
 
 import httpx
@@ -393,18 +393,39 @@ class PhoneMediaFetcher:
         )
         return listing.strip().splitlines()[0].strip() if listing.strip() else ""
 
-    async def _locate_recent_image(self) -> str:
-        # Same preference as _locate_file: anything the companion script pulled
-        # down is a deliberate fetch for a just-received message.
-        recent = await self._su(
-            f"find {self.WEKIT_DOWNLOAD_DIR} -type f "
-            f"-mmin -{max(1, self.window_s // 60)} 2>/dev/null | head -5"
-        )
-        picked = [p.strip() for p in recent.splitlines() if p.strip()]
-        if picked:
-            return picked[0]
+    # File extensions the companion script writes per media kind, in preference
+    # order (WeKit saves a voice note as both mp3 and amr; we want the mp3).
+    _MEDIA_EXTS: ClassVar[dict] = {
+        "photo": (".jpg", ".jpeg", ".png", ".gif"),
+        "voice": (".mp3", ".amr", ".silk"),
+        "sticker": (".gif", ".png"),
+        "video": (".mp4",),
+    }
 
-        # Newest image written inside the window, preferring a full image over a
+    async def _newest_downloaded(self, exts: tuple) -> str:
+        """Newest file the companion script downloaded whose extension is in exts.
+
+        The script writes each received attachment into WEKIT_DOWNLOAD_DIR right
+        before dispatch runs, so the newest file of the right type is this
+        message's. When several extensions share a basename (mp3 + amr for a
+        voice note), the preference order in exts decides which is returned.
+        """
+        listing = await self._su(f"ls -t {shlex.quote(self.WEKIT_DOWNLOAD_DIR)} 2>/dev/null")
+        names = [n.strip() for n in listing.splitlines() if n.strip()]  # newest first
+        matches = [n for n in names if n.lower().endswith(exts)]
+        if not matches:
+            return ""
+        stem = os.path.splitext(matches[0])[0]
+        for ext in exts:
+            if stem + ext in names:
+                return f"{self.WEKIT_DOWNLOAD_DIR}/{stem + ext}"
+        return f"{self.WEKIT_DOWNLOAD_DIR}/{matches[0]}"
+
+    async def _locate_recent_image(self) -> str:
+        remote = await self._newest_downloaded(self._MEDIA_EXTS["photo"])
+        if remote:
+            return remote
+        # Fallback: WeChat's own image store, preferring a full image over a
         # thumbnail (WeChat names thumbnails th_*).
         script = (
             "for d in /data/data/com.tencent.mm/MicroMsg/*/image2; do "
@@ -419,6 +440,23 @@ class PhoneMediaFetcher:
         full = [p for p in paths if not os.path.basename(p).startswith("th_")]
         return (full or paths)[0]
 
+    async def _locate_wechat_video(self) -> str:
+        """Best-effort: a recently-saved video in WeChat's own store.
+
+        WeKit has no video download endpoint, so a video is only reachable if
+        WeChat itself already wrote it (auto-download on, or the user tapped it).
+        """
+        script = (
+            "for d in /data/data/com.tencent.mm/MicroMsg/*/video "
+            "/sdcard/Android/data/com.tencent.mm/MicroMsg/*/video; do "
+            f'[ -d "$d" ] && find "$d" -type f -name "*.mp4" '
+            f"-mmin -{max(1, self.window_s // 60)} 2>/dev/null; "
+            "done | head -10"
+        )
+        out = await self._su(script)
+        paths = [p.strip() for p in out.splitlines() if p.strip()]
+        return paths[0] if paths else ""
+
     @classmethod
     def _deobfuscate(cls, data: bytes) -> bytes:
         """Undo WeChat's single-byte XOR on stored images, when present."""
@@ -432,6 +470,10 @@ class PhoneMediaFetcher:
                 return bytes(b ^ key for b in data)
         return data
 
+    #: Media kinds this fetcher can retrieve. Text-only kinds (link, location,
+    #: quote, contact card, transfer) carry no file and are not listed.
+    FETCHABLE = ("document", "photo", "voice", "sticker", "video")
+
     async def fetch(self, kind: str, meta: dict) -> str:
         """Return a local path on the agent host, or "" when unavailable."""
         try:
@@ -440,6 +482,14 @@ class PhoneMediaFetcher:
                 local_name = meta["filename"]
             elif kind == "photo":
                 remote = await self._locate_recent_image()
+                local_name = os.path.basename(remote) if remote else ""
+            elif kind in ("voice", "sticker"):
+                remote = await self._newest_downloaded(self._MEDIA_EXTS[kind])
+                local_name = os.path.basename(remote) if remote else ""
+            elif kind == "video":
+                # WeKit cannot download video; fall back to WeChat's own store.
+                remote = (await self._newest_downloaded(self._MEDIA_EXTS["video"])
+                          or await self._locate_wechat_video())
                 local_name = os.path.basename(remote) if remote else ""
             else:
                 return ""
@@ -630,11 +680,18 @@ class PhoneMediaFetcher:
         return shots
 
 
+_ATTACH_NOUN = {
+    "document": "file", "photo": "image", "voice": "voice recording",
+    "sticker": "sticker", "video": "video",
+}
+
+
 def _attach_note(text: str, kind: str, local_path: str) -> str:
     """Replace the "not transferred" caveat once the media actually arrived."""
     lines = [ln for ln in text.splitlines()
-             if "was not transferred to the agent" not in ln]
-    what = "file" if kind == "document" else "image"
+             if "was not transferred to the agent" not in ln
+             and "not transferred to the agent" not in ln]
+    what = _ATTACH_NOUN.get(kind, "file")
     lines.append(f"(The {what} is attached and readable at: {local_path})")
     return "\n".join(lines)
 
@@ -995,7 +1052,7 @@ class WeKitAdapter(BasePlatformAdapter):
         # the poll loop. Failure just leaves the text description in place.
         media_urls: list[str] = []
         media_types: list[str] = []
-        if self._media and kind in ("document", "photo"):
+        if self._media and kind in PhoneMediaFetcher.FETCHABLE:
             local = await self._media.fetch(kind, meta)
             if local:
                 media_urls = [local]

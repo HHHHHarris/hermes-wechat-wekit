@@ -365,3 +365,41 @@ def test_article_extraction_unescapes_entities():
            b'<p>A &amp; B &lt;tag&gt;</p></div></div></body></html>')
     _title, text = _article_text_from_html(doc)
     assert "A & B <tag>" in text
+
+
+# ── media fetch routing (which kinds get a real file pulled) ──────────────
+
+from plugin.adapter import PhoneMediaFetcher  # noqa: E402
+
+
+def test_every_downloadable_media_kind_is_fetchable():
+    # A regression guard: voice and sticker were downloaded by the companion
+    # script but never attached because fetch() only handled document/photo.
+    assert set(PhoneMediaFetcher.FETCHABLE) == {
+        "document", "photo", "voice", "sticker", "video"}
+
+
+def test_text_only_kinds_are_not_fetchable():
+    for kind in ("text", "location", "quote", "link"):
+        assert kind not in PhoneMediaFetcher.FETCHABLE
+
+
+def test_voice_prefers_mp3_over_amr():
+    # WeKit saves a voice note as both; the mp3 is the playable one.
+    exts = PhoneMediaFetcher._MEDIA_EXTS["voice"]
+    assert exts.index(".mp3") < exts.index(".amr")
+
+
+def test_media_kind_to_message_type_covers_every_fetchable_kind():
+    from plugin.adapter import _MEDIA_KIND_TO_TYPE
+    for kind in PhoneMediaFetcher.FETCHABLE:
+        assert kind in _MEDIA_KIND_TO_TYPE
+
+
+def test_attach_note_names_each_media_kind():
+    from plugin.adapter import _attach_note
+    for kind, noun in (("document", "file"), ("photo", "image"),
+                       ("voice", "voice"), ("video", "video"), ("sticker", "sticker")):
+        note = _attach_note("[x] placeholder", kind, "/tmp/x")
+        assert noun in note.lower()
+        assert "/tmp/x" in note

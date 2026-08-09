@@ -233,7 +233,11 @@ Useful facts behind this design: WeKit's API+MCP server toggle **persists across
 | Inbound whitelist | ✅ | Matched against the conversation id **or** the sender id |
 | No echo loop | ✅ | WeKit does not report the agent's own outgoing messages |
 | Receive non-text (image/voice/file/link/sticker/location/quote) | ✅ | Every payload is decoded into a short, actionable line — filename and size for files, duration for voice, the actual URL for links, the quoted text for replies. The raw XML never reaches the model |
-| Receive the media *itself* | ✅ | Files, voice notes and images are fetched off the phone and handed to the agent as real local files (`media_urls`), so it can open and read them. Needs the companion WeKit script — see [Receiving the actual files](#receiving-the-actual-files) |
+| Receive a file (any extension) | ✅ | Fetched off the phone as a real local file in `media_urls`. WeKit's download is format-agnostic — it pulls the raw bytes, so xlsx / docx / pdf / zip / anything works. Needs the companion WeKit script — see [Receiving the actual files](#receiving-the-actual-files) |
+| Receive an image | ✅ | Same path; de-obfuscated from WeChat's stored form to a real JPEG/PNG |
+| Receive a voice note | ✅ | WeKit decodes it to mp3; attached as a real file |
+| Receive a sticker | ⚠️ | Standard stickers are converted to GIF and attached; a custom-emoji sticker may fail to decode (a text `[Sticker]` label is always given) |
+| Receive a video | ⚠️ | Metadata + a text label always; the file itself only if WeChat has already downloaded it (WeKit exposes no video download endpoint) |
 | Receive an official-account article | ✅ | With `WEKIT_CAPTURE_ARTICLES=true`, a link is opened on the phone and its full text is read from the WebView disk cache (structured text, not just a summary); screenshots as a fallback. See [Official-account articles](#official-account-articles) |
 | Chat history / backfill | ⚠️ Partial | Not used for inbound, but the companion script *does* backfill recently received media that arrived before it was installed |
 | Quote / reply threading | ⚠️ | Inbound quotes are decoded (the quoted text is surfaced); **outbound** `reply_to` is ignored — replies are ordinary messages, not WeChat quotes |
