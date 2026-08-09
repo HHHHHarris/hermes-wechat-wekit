@@ -57,6 +57,7 @@ Inbound flow: the poll loop calls `wait-for-new-message`, parses WeKit's formatt
 | Path | What it is |
 |---|---|
 | `plugin/` | `__init__.py`, `adapter.py`, `plugin.yaml` — the plugin itself; copy into `~/.hermes/plugins/wechat-wekit/` |
+| `phone-script/hermes-media-bridge.js` | WeKit JS-engine script that runs on the phone; required to receive the actual files/images/voice (see below) |
 | `transport/router-dnat/wekit-dnat.sh` | Router-side DNAT script for the recommended WiFi transport |
 | `ops/wechat_watchdog.py` | Optional keepalive for the phone side (HTTP probe, adb only on failure) |
 | `.env.example` | Every environment variable with comments |
@@ -158,7 +159,7 @@ Then restart the gateway and watch for `wechat-wekit: connected to …`, followe
 | `WEKIT_HOME_CHANNEL` | No | convId that scheduled/cron deliveries are sent to |
 | `WEKIT_MEDIA_ADB_PATH` | No | Path to `adb`. Setting it turns on retrieval of received files and images off the phone (see below). Unset = disabled |
 | `WEKIT_MEDIA_DIR` | No | Where retrieved media is written on the agent host. Default `/tmp/wekit-media` |
-| `WEKIT_CAPTURE_ARTICLES` | No | `true` opens official-account articles on the phone and attaches screenshots of them. Takes over the screen briefly — see below |
+| `WEKIT_CAPTURE_ARTICLES` | No | `true` lets a link message open the article on the phone and read its text from the WebView disk cache (screenshots as a fallback). Takes over the screen briefly — see [Official-account articles](#official-account-articles) |
 | `WEKIT_ADB_SERIAL` / `WEKIT_ADB_PATH` / `WEKIT_LOG_PATH` | No | Device serial for media retrieval; the last two are used by the optional keepalive watchdog |
 | `WEKIT_ROUTER_WAN` / `WEKIT_PHONE_HOSTNAME` | No | Used by the router DNAT script only (its WAN-side address and the phone's DHCP hostname) |
 
@@ -233,10 +234,11 @@ Useful facts behind this design: WeKit's API+MCP server toggle **persists across
 | No echo loop | ✅ | WeKit does not report the agent's own outgoing messages |
 | Receive non-text (image/voice/file/link/sticker/location/quote) | ✅ | Every payload is decoded into a short, actionable line — filename and size for files, duration for voice, the actual URL for links, the quoted text for replies. The raw XML never reaches the model |
 | Receive the media *itself* | ✅ | Files, voice notes and images are fetched off the phone and handed to the agent as real local files (`media_urls`), so it can open and read them. Needs the companion WeKit script — see [Receiving the actual files](#receiving-the-actual-files) |
-| Chat history / backfill | ❌ Not used | WeKit exposes conversation history endpoints; this plugin never reads them. See below |
-| Quote / reply threading | ❌ | `reply_to` is accepted and ignored — replies are ordinary messages, not WeChat quotes |
+| Receive an official-account article | ✅ | With `WEKIT_CAPTURE_ARTICLES=true`, a link is opened on the phone and its full text is read from the WebView disk cache (structured text, not just a summary); screenshots as a fallback. See [Official-account articles](#official-account-articles) |
+| Chat history / backfill | ⚠️ Partial | Not used for inbound, but the companion script *does* backfill recently received media that arrived before it was installed |
+| Quote / reply threading | ⚠️ | Inbound quotes are decoded (the quoted text is surfaced); **outbound** `reply_to` is ignored — replies are ordinary messages, not WeChat quotes |
 | Typing indicator | ❌ | `send_typing` is a no-op |
-| Voice / video / file / location / transfer | ❌ | WeKit's API has endpoints for these; this plugin does not wire them up |
+| Send voice / video / file / location / sticker | ❌ | WeKit's API has endpoints for these; only text and image sending are wired up |
 
 Replies are sent as plain text — WeChat renders no markdown. The registered `max_message_length` is 2000.
 
