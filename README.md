@@ -56,7 +56,7 @@ Inbound flow: the poll loop calls `wait-for-new-message`, parses WeKit's formatt
 
 | Path | What it is |
 |---|---|
-| `plugin/` | `__init__.py`, `adapter.py`, `plugin.yaml` — the plugin itself; copy into `~/.hermes/plugins/wechat-wekit/` |
+| `plugin/` | `__init__.py`, `adapter.py`, `actions.py`, `plugin.yaml` — the plugin itself; copy into `~/.hermes/plugins/wechat-wekit/`. `adapter.py` is the message stream, `actions.py` the [action tools](#action-tools) |
 | `phone-script/hermes-media-bridge.js` | WeKit JS-engine script that runs on the phone; required to receive the actual files/images/voice (see below) |
 | `transport/router-dnat/wekit-dnat.sh` | Router-side DNAT script for the recommended WiFi transport |
 | `ops/wechat_watchdog.py` | Optional keepalive for the phone side (HTTP probe, adb only on failure) |
@@ -154,7 +154,9 @@ Then restart the gateway and watch for `wechat-wekit: connected to …`, followe
 | `WEKIT_TOKEN` | **Yes** | Bearer token configured in WeKit's API + MCP server settings. Also gates `hermes gateway status` detection of this platform |
 | `WEKIT_BASE_URL` | **Yes** | Where WeKit's API is reachable **from the agent host**, e.g. `http://192.168.1.50:3001`. There is deliberately no default: if it is unset the platform refuses to connect and tells you so, rather than guessing an address and leaving you with a confusing retry loop |
 | `WEKIT_ALLOWED_USERS` | Recommended | Comma-separated wxids allowed to talk to the agent. **Inbound filter only — outbound is unrestricted** |
+| `WEKIT_ALLOWED_LABEL` | No | Name of a WeChat contact label whose members may talk to the agent; merged into `WEKIT_ALLOWED_USERS` at connect time. See [Labels as the allow-list](#labels-as-the-allow-list) |
 | `WEKIT_ALLOW_ALL_USERS` | No | `1` / `true` / `yes` (case-insensitive) disables the whitelist entirely. Unsafe: anyone who can message the account can drive your agent |
+| `WEKIT_ENABLE_WRITE_ACTIONS` | No | `1` / `true` / `yes` allows the action tools that change the account or are seen by others (friend requests, group membership, contact labels, Moments). Off by default |
 | `WEKIT_POLL_TIMEOUT_MS` | No | Long-poll duration in ms. Default `30000`, values below `5000` are clamped up |
 | `WEKIT_HOME_CHANNEL` | No | convId that scheduled/cron deliveries are sent to |
 | `WEKIT_MEDIA_ADB_PATH` | No | Path to `adb`. Setting it turns on retrieval of received files and images off the phone (see below). Unset = disabled |
@@ -239,12 +241,62 @@ Useful facts behind this design: WeKit's API+MCP server toggle **persists across
 | Receive a sticker | ⚠️ | Standard stickers are converted to GIF and attached; a custom-emoji sticker may fail to decode (a text `[Sticker]` label is always given) |
 | Receive a video | ⚠️ | Metadata + a text label always; the file itself only if WeChat has already downloaded it (WeKit exposes no video download endpoint) |
 | Receive an official-account article | ✅ | With `WEKIT_CAPTURE_ARTICLES=true`, a link is opened on the phone and its full text is read from the WebView disk cache (structured text, not just a summary); screenshots as a fallback. See [Official-account articles](#official-account-articles) |
-| Chat history / backfill | ⚠️ Partial | Not used for inbound, but the companion script *does* backfill recently received media that arrived before it was installed |
+| Read chat history on demand | ✅ | `wechat_pull_history` tool — paged, oldest-first, group senders resolved to names. Not used for inbound backfill (see [Known limitations](#1-inbound-is-edge-triggered--messages-can-be-lost-permanently)) |
+| Re-download media from the CDN | ✅ | The companion script asks WeChat to cache an image/file from the CDN before fetching it, so media the phone never auto-downloaded still reaches the agent |
+| Send a voice message | ✅ | `wechat_send_voice` tool — text is synthesized with edge-tts, converted to SILK on the phone, and sent as a real voice bubble |
+| Send a video | ✅ | `wechat_send_video` tool — multipart to `POST /api/messages/video` |
+| Group member management | ✅ | `wechat_group_members` tool — list / add / remove / invite. Everything but `list` needs `WEKIT_ENABLE_WRITE_ACTIONS` |
+| Accept friend requests | ✅ | `wechat_accept_friend` tool, needs userId + ticket + scene. Gated behind `WEKIT_ENABLE_WRITE_ACTIONS` |
+| Post to Moments (朋友圈) | ✅ | `wechat_post_moment` tool — text or text + images. Gated behind `WEKIT_ENABLE_WRITE_ACTIONS` |
+| Contact labels (标签) | ✅ | `wechat_labels` tool — list labels, read a label's members, assign a contact's labels. A label can also drive the inbound allow-list via `WEKIT_ALLOWED_LABEL` |
 | Quote / reply threading | ⚠️ | Inbound quotes are decoded (the quoted text is surfaced); **outbound** `reply_to` is ignored — replies are ordinary messages, not WeChat quotes |
 | Typing indicator | ❌ | `send_typing` is a no-op |
-| Send voice / video / file / location / sticker | ❌ | WeKit's API has endpoints for these; only text and image sending are wired up |
+| Set / remove group admin | ❌ | WeKit's REST API exposes no endpoint for it (add/remove/invite exist, promotion does not) |
+| Send file / location / sticker as the reply | ❌ | WeKit has endpoints; the reply path is wired for text and image only. Voice and video are reachable through the action tools above |
 
 Replies are sent as plain text — WeChat renders no markdown. The registered `max_message_length` is 2000.
+
+## Action tools
+
+Beyond the message stream, the plugin registers seven tools the agent can call
+during a conversation. They land in the `hermes-wechat-wekit` toolset, which
+Hermes derives from the platform key and enables for this platform on its own —
+there is no config to edit.
+
+| Tool | What it does | Write gate |
+|---|---|---|
+| `wechat_pull_history` | Read recent messages from a conversation, oldest first | — |
+| `wechat_send_voice` | Send a native voice bubble (from text via edge-tts, or a ready mp3) | — |
+| `wechat_send_video` | Send a local video file | — |
+| `wechat_group_members` | `list` members, or `add` / `remove` / `invite` them | writes only |
+| `wechat_accept_friend` | Accept a pending friend request | yes |
+| `wechat_post_moment` | Post text or text + images to Moments | yes |
+| `wechat_labels` | `list` labels, read a label's `members`, or `set` a contact's labels | `set` only |
+
+Sending a message — text, voice, video — is no riskier than the reply the agent
+already sends, so those tools are always live. Anything that changes the
+account's social graph or is visible to other people stays inert until
+`WEKIT_ENABLE_WRITE_ACTIONS=1`: the tools are still registered and still
+described to the model, but they refuse and say what to set. That way the
+account cannot be quietly reshaped by a prompt injected into a message.
+
+`wechat_send_voice` needs `edge-tts` installed on the agent host when called
+with `text`; with `audio_path` it has no extra dependency. The mp3 → SILK
+conversion runs on the phone, in WeKit.
+
+### Labels as the allow-list
+
+`WEKIT_ALLOWED_USERS` is a list of wxids in a file. `WEKIT_ALLOWED_LABEL` is the
+same thing managed from the phone: put every contact the agent should answer
+under one WeChat label, name that label here, and its members are resolved at
+connect time and merged into the allow-list. Adding someone is then a couple of
+taps in WeChat rather than an `.env` edit and a restart.
+
+Two properties worth knowing: the merge is additive, so anything in
+`WEKIT_ALLOWED_USERS` still applies; and a label that fails to resolve is
+logged and ignored, never treated as "allow everyone" — a lookup failure must
+not silently open the account up. Membership is read once at connect, so a
+contact added to the label afterwards takes effect at the next reconnect.
 
 ## Receiving files and images
 
@@ -419,7 +471,9 @@ Practically: one-question-one-answer conversation is reliable; rapid-fire bursts
 - **Never port-forward 3001 to the internet.** The DNAT script deliberately maps a router's *internal* WAN-side address on a private LAN — it is not an internet exposure, and you should not adapt it into one. To cross an untrusted network, tunnel it (WireGuard, SSH) instead of opening the port.
 - **Always set `WEKIT_ALLOWED_USERS`.** `WEKIT_ALLOW_ALL_USERS=true` is for bring-up only; leaving it on means any stranger who messages the account is driving your agent, its tools, and its token budget.
 - **Inbound message content is untrusted input, never instructions.** The platform hint registered by this plugin says so explicitly, but your agent's own prompt and tool permissions are the real boundary.
+- **Leave `WEKIT_ENABLE_WRITE_ACTIONS` off unless you need it.** It is what stands between a message saying "add me to your group" and the agent actually doing it. With the gate off, a prompt injected into an incoming message can still make the agent *try* — the tool refuses. With it on, the tool obeys.
 - **Outbound is not filtered.** The agent can message anyone in the account's contacts.
+- **Moments posts are public to the account's contacts** and are not deleted by anything here. Nothing rate-limits the action tools either: a looping agent can post repeatedly, or churn group membership, faster than a human would.
 - The image sender will fetch any `http(s)://` URL it is handed and read any local path — keep that in mind when an agent chooses the argument.
 - Don't commit your `.env`. The token, your wxids, and your LAN topology are all in it.
 

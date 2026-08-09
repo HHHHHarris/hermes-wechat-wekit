@@ -146,6 +146,25 @@ function onLoad() {
                     storage.remove(key);
                     if (!endpoint) continue;
 
+                    // For images and files, ask WeChat to pull the bytes from
+                    // the CDN into its own cache first. A message WeChat never
+                    // auto-downloaded (large image on mobile data, an old file)
+                    // has no local bytes, so a bare GET would only ever return a
+                    // thumbnail or fail — this closes that gap. The cache call is
+                    // idempotent, so running it on already-cached media is cheap.
+                    // Voice and stickers have no cache endpoint; they GET directly.
+                    if (endpoint === "image" || endpoint === "file") {
+                        var cacheUrl = API + "/messages/" + id + "/" + endpoint + "/cache" +
+                            (endpoint === "file" && talker ?
+                                ("?talker=" + encodeURIComponent(talker)) : "");
+                        var cresp = http.post(cacheUrl, null, null,
+                                              { Authorization: "Bearer " + TOKEN });
+                        if (cresp && !cresp.ok) {
+                            log.w("hermes-media-bridge: cache " + endpoint + " " + id +
+                                  " status=" + cresp.status);
+                        }
+                    }
+
                     var url = API + "/messages/" + id + "/" + endpoint;
                     var resp = http.get(url, talker ? { talker: talker } : {},
                                         { Authorization: "Bearer " + TOKEN });

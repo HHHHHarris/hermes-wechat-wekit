@@ -36,3 +36,11 @@ optional_env:
     description: "Set 1/true to accept messages from any contact. Unsafe: anyone who messages the account reaches your agent."
     prompt: "Allow all contacts? (true/false)"
     password: false
+  - name: WEKIT_ALLOWED_LABEL
+    description: "Name of a WeChat contact label (标签) whose members may talk to the agent. Resolved at connect time and merged into WEKIT_ALLOWED_USERS, so access is managed from the phone instead of .env. A label that fails to resolve is ignored, never treated as allow-everyone."
+    prompt: "Allow-list label"
+    password: false
+  - name: WEKIT_ENABLE_WRITE_ACTIONS
+    description: "Set 1/true to let the agent take actions that change the account or are visible to others: accept friend requests, add/remove/invite group members, assign contact labels, post to Moments. Off by default; the read-only and send-a-message tools work regardless."
+    prompt: "Enable account-changing actions? (true/false)"
+    password: false
