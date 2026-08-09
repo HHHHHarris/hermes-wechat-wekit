@@ -78,11 +78,23 @@ def test_unparseable_payloads_are_rejected_rather_than_guessed(junk):
 # Getting this wrong is silent: a mistyped wxid drops every message with only a
 # debug-level log line to show for it.
 
-def allowed(allowlist, allow_all, conv_id, sender):
-    """Mirrors the check in _dispatch."""
-    if allowlist and not allow_all:
-        return bool({conv_id, sender} & allowlist)
-    return True
+def allowed(allowlist, allow_all, conv_id, sender, *,
+            label="", label_unresolved=False):
+    """Ask the real adapter, not a copy of its logic.
+
+    These tests used to run against a local reimplementation of the gate, which
+    meant deleting the gate itself left them green — and the bug that eventually
+    turned up (an unresolved label admitting everyone) lived in exactly the
+    difference between the copy and the original.
+    """
+    a = wk.WeKitAdapter.__new__(wk.WeKitAdapter)
+    a.static_allowed = set(allowlist)
+    a.label_allowed = set()
+    a.allowed_contacts = set(allowlist)
+    a.allow_all = allow_all
+    a.allowed_label = label
+    a.label_unresolved = label_unresolved
+    return a._is_allowed(conv_id, sender)
 
 
 def test_direct_message_from_a_listed_contact_is_allowed():
@@ -108,12 +120,41 @@ def test_group_message_from_strangers_in_an_unlisted_group_is_dropped():
 
 
 def test_an_empty_whitelist_allows_everything():
-    # Documented fail-open: no whitelist configured means no filtering.
+    # Documented default: nothing configured means no filtering.
     assert allowed(set(), False, "wxid_anyone", "wxid_anyone")
 
 
 def test_allow_all_overrides_the_whitelist():
     assert allowed({"wxid_me"}, True, "wxid_stranger", "wxid_stranger")
+
+
+# The label allow-list must fail CLOSED. An empty set normally means "no
+# filter", so a label that was asked for and could not be read would otherwise
+# hand the account to anyone who messages it — the one direction this error
+# must never go.
+
+def test_a_label_that_failed_to_resolve_does_not_admit_everyone():
+    assert not allowed(set(), False, "wxid_stranger", "wxid_stranger",
+                       label="hermes", label_unresolved=True)
+
+
+def test_a_configured_label_with_no_members_does_not_admit_everyone():
+    # Label configured, lookup succeeded, nobody carries it: still not "open".
+    assert not allowed(set(), False, "wxid_stranger", "wxid_stranger",
+                       label="hermes")
+
+
+def test_a_failed_label_still_honours_the_env_list():
+    # Falling back to WEKIT_ALLOWED_USERS is the point of keeping both.
+    assert allowed({"wxid_me"}, False, "wxid_me", "wxid_me",
+                   label="hermes", label_unresolved=True)
+    assert not allowed({"wxid_me"}, False, "wxid_x", "wxid_x",
+                       label="hermes", label_unresolved=True)
+
+
+def test_allow_all_still_wins_over_an_unresolved_label():
+    assert allowed(set(), True, "wxid_stranger", "wxid_stranger",
+                   label="hermes", label_unresolved=True)
 
 
 # ── configuration ────────────────────────────────────────────────────────

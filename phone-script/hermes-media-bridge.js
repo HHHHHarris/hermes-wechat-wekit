@@ -27,10 +27,33 @@
  * onLoad() does the downloading.
  */
 
-var TOKEN = "Hermes";                        // must match WeKit's API server token
+// EDIT THIS before pushing the script to the phone: it must equal the token set
+// in WeKit's "API + MCP server" settings. It is a real credential — full read
+// and send access to the WeChat account — so it stays a placeholder in the repo
+// and never gets committed with a live value.
+var TOKEN = "PUT-YOUR-WEKIT-TOKEN-HERE";
 var API = "http://127.0.0.1:3001/api";       // WeKit listens inside this process
 var QUEUE_PREFIX = "hermes_pending_";
 var POLL_INTERVAL_S = 2;
+// Attempts before an item is abandoned. Bounded so one permanently broken
+// message cannot be retried forever, but more than one so a timeout or a
+// momentary hiccup does not silently cost the user their attachment.
+var MAX_TRIES = 3;
+
+/**
+ * One-line summary of an http response for the log.
+ * WeKit builds the response object itself and an error path can leave `status`
+ * or `ok` absent, so nothing here assumes a field exists — an earlier version
+ * printed "status=undefined" and called a working download a failure.
+ */
+function describe(resp) {
+    if (!resp) return "no response";
+    var status = (typeof resp.status === "number") ? resp.status : "?";
+    var out = "status=" + status + " ok=" + (resp.ok === true);
+    if (resp.error) out += " err=" + resp.error;
+    else if (resp.body) out += " body=" + String(resp.body).substring(0, 120);
+    return out;
+}
 
 // WeChat message type -> the WeKit download endpoint that understands it.
 // 1090519089 (0x41000031) is the variant WeChat uses for file transfers.
@@ -81,6 +104,15 @@ function backfill(limit) {
 
 function onLoad() {
     log.i("hermes-media-bridge: starting");
+
+    // Fail loudly rather than at the first download: an unedited token turns
+    // every fetch into a 401 whose only trace is a warning line, which reads
+    // like "media retrieval is flaky" instead of "the script was never set up".
+    if (TOKEN === "PUT-YOUR-WEKIT-TOKEN-HERE") {
+        log.e("hermes-media-bridge: TOKEN is still the placeholder — edit it to " +
+              "match WeKit's API server token, then reload the script. " +
+              "No media will be downloaded until you do.");
+    }
 
     xposed.hookAfter(
         "com.tencent.wcdb.database.SQLiteDatabase",
@@ -140,11 +172,21 @@ function onLoad() {
                     var parts = String(storage.get(key)).split("|");
                     var endpoint = ENDPOINT[parseInt(parts[0], 10)];
                     var talker = parts.length > 1 ? parts[1] : "";
+                    var tries = parts.length > 2 ? parseInt(parts[2], 10) : 0;
+                    if (isNaN(tries)) tries = 0;
 
-                    // Drop it first: a download that fails must not be retried
-                    // forever, and a stuck entry would block everything behind it.
-                    storage.remove(key);
-                    if (!endpoint) continue;
+                    if (!endpoint) { storage.remove(key); continue; }
+
+                    // An entry is dropped only on a *definite* outcome, or once
+                    // it has burned its attempts. An earlier version dropped it
+                    // before even trying, which meant one transient failure lost
+                    // the attachment for good.
+                    tries++;
+                    if (tries >= MAX_TRIES) {
+                        storage.remove(key);
+                    } else {
+                        storage.set(key, parts[0] + "|" + talker + "|" + tries);
+                    }
 
                     // For images and files, ask WeChat to pull the bytes from
                     // the CDN into its own cache first. A message WeChat never
@@ -154,26 +196,49 @@ function onLoad() {
                     // idempotent, so running it on already-cached media is cheap.
                     // Voice and stickers have no cache endpoint; they GET directly.
                     if (endpoint === "image" || endpoint === "file") {
-                        var cacheUrl = API + "/messages/" + id + "/" + endpoint + "/cache" +
-                            (endpoint === "file" && talker ?
-                                ("?talker=" + encodeURIComponent(talker)) : "");
-                        var cresp = http.post(cacheUrl, null, null,
-                                              { Authorization: "Bearer " + TOKEN });
-                        if (cresp && !cresp.ok) {
+                        // Isolated: the cache step is an *optimisation* — it
+                        // helps when WeChat never downloaded the media — so if
+                        // it throws (an older WeKit without this endpoint, a
+                        // socket error) the download must still be attempted.
+                        // Sharing the outer try/catch would have skipped the GET.
+                        try {
+                            var cacheUrl = API + "/messages/" + id + "/" + endpoint + "/cache" +
+                                (endpoint === "file" && talker ?
+                                    ("?talker=" + encodeURIComponent(talker)) : "");
+                            var cresp = http.post(cacheUrl, null, null,
+                                                  { Authorization: "Bearer " + TOKEN });
+                            // Logged either way: on success this is the only
+                            // evidence the CDN step ran at all, and inferring it
+                            // from a missing warning is not evidence.
+                            log.i("hermes-media-bridge: cache " + endpoint + " " + id +
+                                  " -> " + describe(cresp));
+                        } catch (ce) {
                             log.w("hermes-media-bridge: cache " + endpoint + " " + id +
-                                  " status=" + cresp.status);
+                                  " threw (" + ce + ") — downloading anyway");
                         }
                     }
 
                     var url = API + "/messages/" + id + "/" + endpoint;
                     var resp = http.get(url, talker ? { talker: talker } : {},
                                         { Authorization: "Bearer " + TOKEN });
-                    if (resp && resp.ok) {
+                    if (resp && resp.ok === true) {
+                        storage.remove(key);          // definite success
                         log.i("hermes-media-bridge: downloaded " + id + " -> " + resp.body);
                     } else {
-                        log.w("hermes-media-bridge: download failed for " + id +
-                              " status=" + (resp ? resp.status : "none") +
-                              " err=" + (resp ? (resp.error || resp.body) : "no response"));
+                        // NOT necessarily a failure, which is why the retry is
+                        // worth having. This endpoint answers with the saved
+                        // *path*, not the bytes, so the 10s read timeout baked
+                        // into WeKit's HTTP client is spent on WeChat pulling
+                        // from the CDN — a large attachment blows through it
+                        // while the download itself carries on. The next attempt
+                        // then finds the file already cached and returns almost
+                        // at once. The agent locates media by scanning the
+                        // download folder anyway, so a timeout here does not
+                        // mean the user lost the file.
+                        log.w("hermes-media-bridge: download " + endpoint + " " + id +
+                              " inconclusive (attempt " + tries + "/" + MAX_TRIES + ") -> " +
+                              describe(resp) + " — the file may still have landed; " +
+                              "large media exceeds WeKit's 10s HTTP read timeout");
                     }
                 }
             } catch (e) {

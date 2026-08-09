@@ -271,11 +271,9 @@ A `caption` is sent as a **separate follow-up text message** after the image suc
 
 > **Security note:** the `http(s)` branch fetches whatever URL it is given, from inside your network, with no allowlist. If your agent can be induced to call `send_image` with an attacker-chosen URL, that is an SSRF vector. Treat message content as untrusted input (the registered platform hint says exactly this) and consider restricting image sources in hostile environments.
 
-### 4.3 What this adapter deliberately does not use
+### 4.3 The reply path is narrow on purpose; the rest is in the action tools
 
-WeKit exposes a much larger REST surface — voice, video, file, emoji, pat, location, quote, revoke, system messages, share endpoints, group member management, moments, transfers, contacts, labels — plus `GET /api/conversations/{convId}/history` with paging parameters.
-
-**This adapter uses only four endpoints:**
+The **reply path** — what `send()` does when the agent answers a message — uses four endpoints and nothing else:
 
 | Endpoint | Used for |
 |---|---|
@@ -284,7 +282,33 @@ WeKit exposes a much larger REST surface — voice, video, file, emoji, pat, loc
 | `POST /api/messages/image` | outbound image (multipart) |
 | `GET /api/contacts/{wxid}` | display-name resolution |
 
-Everything else is unexercised by this project and is not documented here. Notably, `reply_to` and `metadata` are accepted by `send()` and **ignored** — there is no quoting or threading, even though WeKit has a quote endpoint. `send_typing()` is a no-op.
+`reply_to` and `metadata` are accepted by `send()` and **ignored** — there is no quoting or threading, even though WeKit has a quote endpoint. `send_typing()` is a no-op.
+
+Everything else WeKit offers is reached deliberately, through **action tools the agent calls** (`plugin/actions.py`, §4.4) rather than implicitly on the reply path. Keeping the split means the code that runs on every inbound message stays small and predictable, and anything with a side effect is something the model had to choose.
+
+### 4.4 Action tools
+
+`actions.py` is two layers. `WeKitActions` is a plain async wrapper over the REST surface that imports nothing from Hermes — which is what makes it testable against a mocked `httpx` client, and lets the adapter reuse it (it resolves the allow-list label through the same class). On top sit seven tools registered via `ctx.register_tool()`:
+
+| Tool | Endpoints |
+|---|---|
+| `wechat_pull_history` | `GET conversations/{convId}/history` (paged) |
+| `wechat_send_voice` | `POST media/upload` → `utils/audio/mp3-to-silk` → `utils/audio/duration` → `messages/voice` |
+| `wechat_send_video` | `POST messages/video` (multipart) |
+| `wechat_group_members` | `GET groups/{id}/members`, `POST groups/{id}/members/{add,delete,invite}` |
+| `wechat_accept_friend` | `POST contacts/verify` |
+| `wechat_post_moment` | `POST moments/text`, `POST moments/pics` (multipart) |
+| `wechat_labels` | `GET labels`, `GET labels/{id\|name}/contacts`, `POST contacts/{wxId}/labels` |
+
+They land in the toolset `hermes-wechat-wekit`. That name is not arbitrary: for a plugin platform, `_get_platform_tools()` in `hermes_cli/tools_config.py` derives the default toolset as `hermes-{platform_key}`, so a toolset named after the platform is enabled for its sessions with no config edit. A `platform_toolsets:` entry for `wechat-wekit` in `config.yaml` would override that and must then list the toolset explicitly.
+
+Two behaviours are worth knowing because they are not obvious from the endpoint list:
+
+**The write gate.** Accepting friends, changing group membership, assigning labels and posting to Moments all refuse unless `WEKIT_ENABLE_WRITE_ACTIONS` is truthy. The tools stay registered and described either way — a prompt injected into an incoming message can make the agent *try* and be refused, which is a much better failure than the tool not existing and the model improvising something else.
+
+**Labels only exist if WeChat made them.** `POST contacts/{wxId}/labels` resolves each name to a label id; a name it cannot resolve is skipped with a log line and the endpoint still answers `200`. So an unknown name is a silent no-op at the API level. `set_contact_labels()` therefore checks names against `GET labels` first and raises. WeKit has a `createLabel` internally (it drives the `addcontactlabel` CGI) but does not expose it over REST, so a new label has to be made in the WeChat UI.
+
+**Voice needs no local encoder.** SILK conversion happens on the phone (`utils/audio/mp3-to-silk`); the host only has to produce an mp3, which `edge-tts` does when the tool is called with `text`.
 
 ---
 
@@ -451,6 +475,16 @@ Semantics per conversation kind:
 
   There is no "this person, in this group" granularity.
 
+**Driving the list from a WeChat label.** `WEKIT_ALLOWED_LABEL` names a contact label; at the end of `connect()`, `_resolve_label_allowlist()` reads its members (`GET labels/{name}/contacts`) and merges them into `allowed_contacts`. Access is then managed on the phone instead of in `.env`.
+
+Three things about that merge, each chosen rather than fallen into:
+
+- It is **additive** (`|=`), so `WEKIT_ALLOWED_USERS` still applies. Keeping both means a label that resolves badly cannot lock the operator out of their own agent.
+- A lookup that **fails or returns nothing is logged and ignored** — never treated as "allow everyone". A failure must never widen access; that is the one direction an error here must not go.
+- Membership is re-read **on connect and then every ~10 minutes** (`_LABEL_REFRESH_ROUNDS` poll rounds), between polls on the poll task itself so it can neither overlap itself nor hold the WCDB listener open. Granting or revoking on the phone therefore takes effect without a restart, within that window.
+
+The label must already exist in WeChat (§4.4). Note the read goes through `rcontact.contactLabelIds`, so it reflects what WeChat has actually persisted — a label assignment that has not come back from the server yet will not be visible.
+
 Three further properties, all deliberate:
 
 1. **Outbound is not filtered.** `send()` and `send_image()` will deliver to any `chat_id` the agent asks for. The whitelist is an inbound trust boundary, not an outbound leash — which, combined with the ToS warning at the top of this document, means the agent's own judgement is the only thing standing between you and a spam-flagged account.
@@ -468,7 +502,9 @@ Three further properties, all deliberate:
 | `WEKIT_TOKEN` | **yes** | Bearer token configured in WeKit's API + MCP server settings |
 | `WEKIT_BASE_URL` | **yes** | e.g. `http://192.168.1.50:3001` — where the phone's WeKit API is reachable **from the agent host**. Required; there is no default (§10 gap 8). |
 | `WEKIT_ALLOWED_USERS` | recommended | comma-separated wxids allowed to talk to the agent (inbound filter only; outbound unrestricted) |
+| `WEKIT_ALLOWED_LABEL` | no | name of a WeChat contact label whose members are merged into the whitelist at connect time (§8) |
 | `WEKIT_ALLOW_ALL_USERS` | no | `true` disables the whitelist — unsafe, discovery use only |
+| `WEKIT_ENABLE_WRITE_ACTIONS` | no | `true` lets the action tools that change the account or are visible to others actually run (§4.4) |
 | `WEKIT_POLL_TIMEOUT_MS` | no | long-poll duration, default `30000`, floored at `5000`, must stay below the 60 s read timeout |
 | `WEKIT_HOME_CHANNEL` | no | wxid that scheduled/cron messages get delivered to |
 | `WEKIT_ADB_SERIAL`, `WEKIT_ADB_PATH`, `WEKIT_LOG_PATH` | no | watchdog script only (§7) |
@@ -510,7 +546,18 @@ This is why the adapter contains **no content-based deduplication**. `wait-for-n
 
 **6. `send_image` accepts arbitrary `http(s)` URLs** and fetches them from inside your network (§4.2).
 
-**7. No inbound media.** Images, voice, video and files arrive as placeholder text like `[image message]`; nothing is downloaded or shown to the agent. There is likewise no quoting/reply threading (`reply_to` is ignored) and no typing indicator.
+**7. Inbound media is best-effort and needs two extra pieces.** Every non-text payload is decoded to a readable description, but the *bytes* reach the agent only when `WEKIT_MEDIA_ADB_PATH` is set **and** the companion phone script is installed — the script exists because WeKit's download endpoints are all keyed by `msgSvrId` and no WeKit API ever hands one out. Even then, video has no download endpoint at all, and a custom-emoji sticker may fail to decode. There is likewise no quoting/reply threading (`reply_to` is ignored) and no typing indicator.
+
+**11. Some WeChat capabilities are not reachable at all through WeKit's REST surface.** Worth stating precisely, because it is easy to assume the gap is in this plugin:
+
+| Wanted | Why it is not here |
+|---|---|
+| Set / remove a group admin | WeChat drives it over the `addchatroomadmin` / `updatechatroomadmin` CGI. WeKit's REST has `members/add`, `members/delete` and `members/invite`, but no promotion endpoint, and its JS `wechat` namespace exposes no chatroom admin call either. The only route is hand-building the CGI through `wechat.sendCgi` in a phone-side script — undocumented, version-fragile, and the kind of unusual traffic most likely to draw attention to the account. |
+| Create a contact label | Same shape: `addcontactlabel` is a CGI, and WeKit's internal `createLabel` is not exposed over REST. Make the label in the WeChat UI. |
+| Blacklist a contact | No endpoint; same CGI-only situation. |
+| Download a video | WeKit has image / file / voice / sticker download endpoints and no video one. |
+
+Everything else this project needed turned out to be on the REST surface already, which is worth remembering before reaching for a hook: read `ApiServer.kt`'s `restRoutes()` first.
 
 **8. `base_url` has no default at all.** `WEKIT_BASE_URL` is required. With it unset, `connect()` logs what to set and returns `False` instead of guessing an address — a wrong guess produces a connect-retry loop that looks like a network fault rather than a missing setting. Earlier revisions did guess (the agent host's default gateway on port `13001`, an artefact of the USB-bridge topology in §7); that fallback has been removed.
 

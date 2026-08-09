@@ -456,12 +456,73 @@ grep 'wechat-wekit: dispatch failed'       "$AGENT_LOG" | tail -20  # background
 
 | Symptom | Confirm | Cause / fix |
 |---|---|---|
-| The agent sees `[image message]`, `[voice message]`, `[file/link/app message]` | Compare with the raw `inbound from … type=N` line | Expected. Non-text messages whose content comes through **empty** get a placeholder derived from the WeChat type code (unknown codes render as `[typeN message]`); a non-text message that does carry content is passed through as-is. Everything is delivered to the agent as a text event — **the plugin never downloads media.** |
+| The agent sees `[image message]`, `[voice message]`, `[file/link/app message]` | Compare with the raw `inbound from … type=N` line | Non-text payloads are decoded into a readable line (filename and size, voice duration, the link's URL). A payload that arrives **empty** falls back to a placeholder from the WeChat type code (unknown codes render as `[typeN message]`). The actual bytes are attached only when media retrieval is on — `WEKIT_MEDIA_ADB_PATH` set **and** the companion phone script installed. Without both, the description is all the agent gets. |
 | Log shows less text than the user sent | — | The `inbound from` line truncates the preview to 60 characters. The full text is still dispatched. |
 | Contact names show as raw wxids instead of nicknames | `curl -sS "$WEKIT_BASE_URL/api/contacts/wxid_xxxxxxxx" -H "Authorization: Bearer $WEKIT_TOKEN"` | The lookup failed (failures are `DEBUG`-level) and it fell back to the id. The adapter prefers `remarkName`, then `nickname`. Successful lookups are cached per-process, so a name changed on the phone won't refresh until the gateway restarts; failed lookups are *not* cached and are retried on every message. |
 | A group's messages are ignored while DMs work | Check what `inbound from` prints for the group | For groups `conv_id` is the chatroom id ending in `@chatroom` / `@im.chatroom`. Whitelist that id to admit the group. In a DM, `conv_id` and `sender` are both the peer's wxid, which is why a bare wxid works there. |
 | Duplicate replies / the agent talking to itself | Check which platform plugins are enabled | Two plugins bound to the same WeChat account will double-send and can loop. Enable exactly one WeChat channel — in the reference deployment the older phone-UI plugin had to be explicitly disabled. |
 | The agent follows instructions embedded in someone's WeChat message | — | Message content is untrusted input, not instructions. The platform hint says so, but a whitelist is your actual control. Keep `WEKIT_ALLOW_ALL_USERS` off. |
+
+---
+
+## 11. The action tools
+
+### The agent doesn't seem to have the tools
+
+Confirm they registered at all. This loads the plugin exactly the way the gateway does:
+
+```bash
+cd /usr/local/lib/hermes-agent && ./venv/bin/python - <<'PY'
+from hermes_cli.plugins import PluginManager
+PluginManager().discover_and_load()
+from tools.registry import registry
+d = getattr(registry, "_tools", None) or registry.tools
+for n in sorted(n for n in d if n.startswith("wechat_")):
+    print(n, d[n].toolset)
+from toolsets import resolve_toolset
+print(sorted(resolve_toolset("hermes-wechat-wekit")))
+PY
+```
+
+All seven should print with toolset `hermes-wechat-wekit`. If they do but the agent still cannot call them, the toolset is registered and not *enabled*: for a plugin platform Hermes defaults the enabled toolset to `hermes-{platform}`, which is why the name matches — but a `platform_toolsets:` block for `wechat-wekit` in `~/.hermes/config.yaml` overrides that default, and must then list `hermes-wechat-wekit` explicitly or the tools vanish for this platform only.
+
+If nothing prints, the plugin failed to import. Run the same load with the traceback visible — a syntax error or a bad import in `actions.py` takes the whole platform down with it, so the channel going silent at the same moment is the same fault.
+
+### A write action returns an error mentioning `WEKIT_ENABLE_WRITE_ACTIONS`
+
+Working as designed. Accepting friends, changing group membership, assigning labels and posting to Moments refuse until that variable is truthy. Set it in `~/.hermes/.env` and restart the gateway — and understand what you are turning on: with it set, a message from a whitelisted contact saying "add me to your group" is something the agent can actually carry out.
+
+### `wechat_labels action=set` fails with "no such WeChat label"
+
+Also working as designed, and the error lists the labels that do exist. WeChat only accepts a label that already exists; WeKit resolves each name to an id and **skips** — with a log line, and still a `200` — any name it cannot resolve. So this used to look like success while doing nothing. Create the label in the WeChat app (Me → Contacts → Tags), then assign it.
+
+If the name *is* correct and it still fails, re-read `GET /api/labels`: label creation goes out over a CGI and the row appears only once the server has answered.
+
+### A label assignment "succeeded" but the member list is unchanged
+
+Read it back before believing it — that is the whole lesson of the bug above. The membership query reads `rcontact.contactLabelIds`, which reflects what WeChat has persisted, so an assignment still in flight is invisible. Wait a few seconds and re-read. If it never lands, check that the phone has network: the write is a server round trip, not a local edit.
+
+### `WEKIT_ALLOWED_LABEL` didn't admit anyone
+
+Look in `agent.log` (not `gateway.log` — §8) around the connect for one of:
+
+```
+wechat-wekit: allow-list label 'NAME' added N contact(s)
+wechat-wekit: allow-list label 'NAME' resolved to no contacts
+wechat-wekit: could not resolve allow-list label 'NAME': …
+```
+
+The second means the label exists but nobody carries it, or the assignment has not landed yet. The third means the lookup itself failed — the label is then ignored entirely and `WEKIT_ALLOWED_USERS` remains the only gate, which is why you should keep that variable populated rather than relying on the label alone.
+
+Membership is re-read at connect and then every ~10 minutes, and a change is logged as `allow-list changed on refresh: +[...] -[...]`. If you need it immediately, restart the gateway.
+
+### `wechat_send_voice` fails on `edge-tts`
+
+Only the `text` form needs it; `audio_path` with a ready mp3 does not. Install it into the venv the gateway actually runs (`/usr/local/lib/hermes-agent/venv/bin/pip install edge-tts`), not the system Python. The mp3 → SILK conversion happens on the phone, so no local codec is involved.
+
+### A tool reports success but nothing happened in WeChat
+
+Treat every `ok: true` from this API as "the request was accepted", not "the effect exists". Several WeKit endpoints dispatch a CGI and answer immediately. Verify with an independent read — `wechat_pull_history` will show a sent voice message as `<type:voice>`, and the label endpoints will show membership — and prefer that over the write's own return value.
 
 ---
 

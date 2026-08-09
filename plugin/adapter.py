@@ -85,6 +85,12 @@ _MAX_XML_CHARS = 512_000
 
 _XML_START = re.compile(r"<\?xml|<msg\b")
 
+# How many poll rounds between re-reads of the allow-list label. A round is one
+# long-poll window (30s by default), so this is roughly every ten minutes —
+# often enough that granting or revoking access on the phone takes effect
+# without a restart, rare enough to be invisible next to the poll itself.
+_LABEL_REFRESH_ROUNDS = 20
+
 # Our media-kind strings mapped onto Hermes' own MessageType enum, so the agent
 # routes an image like an image rather than like text.
 _MEDIA_KIND_TO_TYPE = {
@@ -885,14 +891,24 @@ class WeKitAdapter(BasePlatformAdapter):
         env_allowed = os.getenv("WEKIT_ALLOWED_USERS", "")
         if env_allowed:
             allowed = [x.strip() for x in env_allowed.split(",") if x.strip()]
-        self.allowed_contacts = {str(x) for x in allowed}
+        # Kept separate from allowed_contacts so label membership can be
+        # *replaced* on each reconnect: merging into one set would mean someone
+        # taken out of the label kept their access until the gateway restarted.
+        self.static_allowed = {str(x) for x in allowed}
+        self.label_allowed: set[str] = set()
+        self.allowed_contacts = set(self.static_allowed)
         # A WeChat contact label can stand in for the hand-kept allow-list: put
         # the contacts you want the agent to answer under one label and set
         # WEKIT_ALLOWED_LABEL to its name. Its members are resolved at connect
-        # time and merged into allowed_contacts, so the two mechanisms compose.
+        # time and merged with the env list, so the two mechanisms compose.
         self.allowed_label = (
             os.getenv("WEKIT_ALLOWED_LABEL") or extra.get("allowed_label") or ""
         ).strip()
+        # Set when a label is configured but could not be read. The inbound gate
+        # treats an empty allow-list as "no filter", so without this flag a
+        # failed lookup would quietly admit everyone — the opposite of what
+        # configuring an allow-list asks for.
+        self.label_unresolved = False
         self.allow_all = str(
             os.getenv("WEKIT_ALLOW_ALL_USERS") or extra.get("allow_all_users") or ""
         ).lower() in ("1", "true", "yes")
@@ -1017,6 +1033,22 @@ class WeKitAdapter(BasePlatformAdapter):
                     task.add_done_callback(self._log_dispatch_error)
                 elif rounds % 5 == 0:
                     logger.info("wechat-wekit: poll alive (%d rounds, no new msg)", rounds)
+
+                # Re-read the allow-list label periodically. Resolving it only
+                # at connect would mean adding someone to the label in WeChat
+                # did nothing until the gateway restarted — which is most of
+                # what the label is for. Done between polls, on the same task,
+                # so it cannot overlap itself or hold the listener open.
+                if self.allowed_label and rounds % _LABEL_REFRESH_ROUNDS == 0:
+                    before = set(self.allowed_contacts)
+                    await self._resolve_label_allowlist()
+                    if self.allowed_contacts != before:
+                        logger.info(
+                            "wechat-wekit: allow-list changed on refresh: "
+                            "+%s -%s",
+                            sorted(self.allowed_contacts - before) or "none",
+                            sorted(before - self.allowed_contacts) or "none",
+                        )
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -1055,11 +1087,9 @@ class WeKitAdapter(BasePlatformAdapter):
 
         is_group = conv_id.endswith(("@chatroom", "@im.chatroom"))
 
-        if self.allowed_contacts and not self.allow_all:
-            who = {conv_id, sender}
-            if not (who & self.allowed_contacts):
-                logger.debug("wechat-wekit: drop msg from unlisted %s", conv_id)
-                return
+        if not self._is_allowed(conv_id, sender):
+            logger.debug("wechat-wekit: drop msg from unlisted %s", conv_id)
+            return
 
         # Try to put the actual file in the agent's hands. Safe to run here:
         # _dispatch is already a background task, so a slow phone cannot stall
@@ -1165,33 +1195,74 @@ class WeKitAdapter(BasePlatformAdapter):
         return True
 
     async def _resolve_label_allowlist(self) -> None:
-        """Fold a WeChat contact label's members into the inbound allow-list.
+        """Rebuild the inbound allow-list from the env list plus a WeChat label.
 
-        Read-only and best-effort: a failed lookup leaves WEKIT_ALLOWED_USERS as
-        the sole gate rather than opening the account up.
+        Read-only. Runs on every connect, and *replaces* the label's contribution
+        rather than adding to it, so removing someone from the label in WeChat
+        actually revokes their access at the next reconnect.
+
+        A lookup that fails, or a label nobody carries, must not widen access —
+        see `_is_allowed`, where `label_unresolved` keeps an empty allow-list
+        from being read as "no filter".
         """
         if not self.allowed_label:
             return
         try:
-            actions = WeKitActions(self.base_url, self.token, self._client)
-            wxids = await actions.contacts_by_label(self.allowed_label)
+            # Deliberately not the shared client: its read timeout is derived
+            # from the long-poll window and can be minutes, and this call sits
+            # in front of the poll task starting. A slow phone must not hold up
+            # the whole platform.
+            actions = WeKitActions(self.base_url, self.token, timeout=15.0)
+            wxids = await asyncio.wait_for(
+                actions.contacts_by_label(self.allowed_label), timeout=20
+            )
         except Exception as e:
+            self.label_unresolved = True
+            self.label_allowed = set()
+            self.allowed_contacts = set(self.static_allowed)
             logger.warning(
-                "wechat-wekit: could not resolve allow-list label %r: %s",
+                "wechat-wekit: could not resolve allow-list label %r: %s — "
+                "inbound is restricted to WEKIT_ALLOWED_USERS%s",
                 self.allowed_label, e,
+                " (which is empty, so everything is dropped)"
+                if not self.static_allowed else "",
             )
             return
-        if wxids:
-            self.allowed_contacts |= {str(w) for w in wxids}
+
+        self.label_allowed = {str(w) for w in wxids}
+        self.allowed_contacts = self.static_allowed | self.label_allowed
+        if self.label_allowed:
+            self.label_unresolved = False
             logger.info(
-                "wechat-wekit: allow-list label %r added %d contact(s)",
-                self.allowed_label, len(wxids),
+                "wechat-wekit: allow-list label %r resolved to %d contact(s); "
+                "%d allowed in total",
+                self.allowed_label, len(self.label_allowed),
+                len(self.allowed_contacts),
             )
         else:
+            self.label_unresolved = True
             logger.warning(
-                "wechat-wekit: allow-list label %r resolved to no contacts",
+                "wechat-wekit: allow-list label %r exists but nobody carries it "
+                "— inbound is restricted to WEKIT_ALLOWED_USERS%s",
                 self.allowed_label,
+                " (which is empty, so everything is dropped)"
+                if not self.static_allowed else "",
             )
+
+    def _is_allowed(self, conv_id: str, sender: str) -> bool:
+        """Whether an inbound message may reach the agent.
+
+        An empty allow-list means "no filter" — that is the documented default
+        for an unconfigured channel. But once an allow-list has been *asked* for
+        and could not be built, empty must mean "nothing", not "everything":
+        failing open is how a lookup error turns into a stranger driving the
+        agent.
+        """
+        if self.allow_all:
+            return True
+        if not self.allowed_contacts:
+            return not (self.allowed_label or self.label_unresolved)
+        return bool({conv_id, sender} & self.allowed_contacts)
 
     async def disconnect(self) -> None:
         self._stopping = True

@@ -38,8 +38,14 @@ jobs:
           # Only code is checked for credential assignments. Docs legitimately
           # show commands like  grep '^WEKIT_TOKEN=' .env  which would otherwise
           # trip this.
+          # *.js matters as much as *.py: the phone-side script cannot read an
+          # environment, so its token is a literal by construction — and this
+          # gate did not look at .js until a live token had already been
+          # published in one. Placeholders are excluded by shape so the
+          # deliberately-uneditable device script can still say what to fill in.
           if grep -rnE '(TOKEN|SERIAL|SECRET|PASSWORD|PASSWD|API_?KEY)[[:space:]]*=[[:space:]]*["'"'"'][^"'"'"']{3,}' \
-               --include='*.py' --include='*.sh' . ; then
+               --include='*.py' --include='*.sh' --include='*.js' . \
+               | grep -viE '(YOUR|REPLACE|CHANGE[-_]?ME|PLACEHOLDER|EXAMPLE|xxxx)' ; then
             echo "::error::credential or device id assigned a literal value — read it from the environment instead"
             fail=1
           fi

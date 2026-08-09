@@ -15,9 +15,15 @@ Two layers live here, deliberately kept apart:
 
 * The tool layer — JSON schemas, handlers, and :func:`register_tools` — wires
   those actions into Hermes as agent-callable tools in the ``hermes-wechat-wekit``
-  toolset.  Because this plugin's platform key is ``wechat-wekit``, Hermes
-  derives that toolset name automatically and enables it for WeChat sessions;
-  no config edit is needed (see ``_get_platform_tools`` in the gateway).
+  toolset.  The name matters: for a plugin platform Hermes derives the default
+  toolset as ``hermes-{platform_key}``, so naming it after the platform is what
+  makes it reach WeChat sessions with no config edit.
+
+  Note it does not *only* reach them.  Hermes treats an unrecognised plugin
+  toolset as on-by-default everywhere, so a CLI or Telegram session gets these
+  tools too until the operator says otherwise via ``hermes tools``.  That is
+  often what you want — driving WeChat from the CLI is useful — but it means
+  the trust boundary is the write gate below, not the platform you are on.
 
 Safety
 ------
@@ -38,7 +44,9 @@ import contextlib
 import mimetypes
 import os
 import posixpath
+import tempfile
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 
@@ -133,6 +141,11 @@ class WeKitActions:
                 json=json_body,
                 files=files,
                 data=data,
+                # A borrowed client carries the adapter's timeout, which is
+                # derived from the long-poll window and can be minutes. These
+                # are ordinary short requests, so they get their own bound
+                # rather than inheriting one meant for a poll.
+                timeout=self._timeout,
             )
 
         try:
@@ -154,9 +167,21 @@ class WeKitActions:
         if not text:
             return None
         try:
-            return resp.json()
+            parsed = resp.json()
         except ValueError:
             return text
+
+        # A 200 is not the same as "it worked". WeKit answers some failures with
+        # HTTP 200 and {"success": false, "error": ...} — the mp3→SILK converter
+        # does exactly that when ffmpeg is missing, and the caller would go on to
+        # send a voice message pointing at a file that was never written. Treat
+        # the body as authoritative, so no action has to remember to.
+        if isinstance(parsed, dict) and (
+            parsed.get("success") is False or parsed.get("error")
+        ):
+            detail = parsed.get("error") or parsed.get("message") or parsed
+            raise WeKitActionError(f"{method} {path} refused: {detail}")
+        return parsed
 
     async def _upload(self, local_path: str) -> str:
         """Push a local file to the phone; return the path WeKit saved it under."""
@@ -186,6 +211,7 @@ class WeKitActions:
         count = max(1, min(int(count), 1000))
         page_size = min(count, 100)
         collected: list[dict] = []
+        previous: list | None = None
         page = 1
         while len(collected) < count:
             batch = await self._request(
@@ -195,6 +221,16 @@ class WeKitActions:
             )
             if not isinstance(batch, list) or not batch:
                 break
+
+            # Stop if the server handed back the same page again — that is what
+            # an endpoint ignoring `page-index` looks like, and continuing would
+            # pad the history with repetition the model reads as real.
+            # Deliberately compared page-against-page rather than deduplicating
+            # messages: a person saying "ok" twice is not a duplicate.
+            if batch == previous:
+                break
+            previous = batch
+
             collected.extend(batch)
             if len(batch) < page_size:
                 break
@@ -335,7 +371,11 @@ class WeKitActions:
         return res if isinstance(res, list) else []
 
     async def contacts_by_label(self, label_id_or_name: str) -> list[str]:
-        res = await self._request("GET", f"labels/{label_id_or_name}/contacts")
+        # Label names are free text a person typed on their phone — Chinese,
+        # spaces, and occasionally a slash. Unescaped, a name like "work/home"
+        # would change the request's path shape rather than be one segment.
+        seg = quote(str(label_id_or_name), safe="")
+        res = await self._request("GET", f"labels/{seg}/contacts")
         return [str(x) for x in res] if isinstance(res, list) else []
 
     async def set_contact_labels(self, wx_id: str, labels: list[str]) -> dict:
@@ -578,7 +618,13 @@ async def _handle_send_voice(args: dict, **_kw: Any) -> str:
             if not text:
                 return tool_error("Provide either text or audio_path.")
             voice = (args.get("voice") or "zh-CN-XiaoxiaoNeural").strip()
-            tmp_created = f"/tmp/wekit-tts-{abs(hash((conv_id, text))) & 0xffffff}.mp3"
+            # A unique name per call: two voice messages sent at once must not
+            # write over each other's audio, and a name derived from the text
+            # would do exactly that when the same line is sent twice.
+            fd, tmp_created = await asyncio.to_thread(
+                tempfile.mkstemp, prefix="wekit-tts-", suffix=".mp3"
+            )
+            os.close(fd)  # edge-tts writes the path itself
             try:
                 await _edge_tts_to_mp3(text, voice, tmp_created)
             except ImportError:

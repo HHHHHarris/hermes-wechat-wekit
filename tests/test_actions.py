@@ -6,7 +6,11 @@ body, query, multipart — is asserted directly, and the tool handlers are
 exercised against a monkeypatched environment.
 """
 
+import asyncio
 import json
+import os
+import tempfile
+from pathlib import Path
 
 import httpx
 import pytest
@@ -200,6 +204,23 @@ async def test_contacts_by_label_returns_strings():
 
 
 @pytest.mark.asyncio
+async def test_contacts_by_label_escapes_the_name():
+    # Label names are typed by a person: Chinese, spaces, sometimes a slash.
+    # Unescaped, "work/home" would become two path segments.
+    fake = FakeWeKit()
+    await actions_with(fake).contacts_by_label("work/home")
+    # The slash must survive as one path segment. httpx decodes .path, so the
+    # raw form is what carries the proof.
+    raw = fake.requests[0].url.raw_path.decode()
+    assert "labels/work%2Fhome/contacts" in raw, raw
+
+    fake2 = FakeWeKit()
+    await actions_with(fake2).contacts_by_label("同事")
+    raw2 = fake2.requests[0].url.raw_path.decode()
+    assert "labels/%E5%90%8C%E4%BA%8B/contacts" in raw2, raw2
+
+
+@pytest.mark.asyncio
 async def test_set_contact_labels_body():
     fake = FakeWeKit()
     fake.route("GET", "/api/labels",
@@ -234,6 +255,54 @@ async def test_set_contact_labels_empty_clears_without_lookup():
 
 
 # ── error surface ──────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_a_200_saying_success_false_is_an_error():
+    # WeKit answers some failures with HTTP 200 and {"success": false}. Reading
+    # only the status is how a write that did nothing gets reported as done —
+    # this project already shipped that bug once, for contact labels.
+    fake = FakeWeKit()
+    fake.route("POST", "/api/moments/text", {"success": False, "error": "nope"})
+    with pytest.raises(act.WeKitActionError) as exc:
+        await actions_with(fake).post_moment_text("hi")
+    assert "nope" in str(exc.value)
+
+
+@pytest.mark.asyncio
+async def test_voice_stops_when_silk_conversion_refuses():
+    # The proven case: mp3-to-silk answers 200 {"success": false} when ffmpeg is
+    # missing, and the old code went on to send a voice message pointing at a
+    # file that was never written.
+    fake = FakeWeKit()
+    fake.route("POST", "/api/media/upload", {"path": "/sdcard/up/a.mp3"})
+    fake.route("POST", "/api/utils/audio/mp3-to-silk",
+               {"success": False, "error": "ffmpeg missing"})
+    fd, mp3 = tempfile.mkstemp(suffix=".mp3")
+    os.close(fd)
+    await asyncio.to_thread(Path(mp3).write_bytes, b"ID3x")
+    try:
+        with pytest.raises(act.WeKitActionError) as exc:
+            await actions_with(fake).send_voice("wxid_y", mp3)
+    finally:
+        os.unlink(mp3)
+    assert "ffmpeg" in str(exc.value)
+    # and crucially it must NOT have gone on to send the message
+    assert not any(r.url.path.endswith("/messages/voice") for r in fake.requests)
+
+
+@pytest.mark.asyncio
+async def test_pull_history_stops_if_the_server_repeats_a_page():
+    # An endpoint that ignores page-index would otherwise pad the history with
+    # repetition the model reads as real conversation.
+    fake = FakeWeKit()
+    page = [{"sender": f"s{i}", "content": f"m{i}", "type": "text"}
+            for i in range(100)]
+    fake.route("GET", "/api/conversations/c/history", page)
+    msgs = await actions_with(fake).pull_history("c", count=500)
+    assert len(msgs) == 100
+    # two requests: the first page, then the repeat that ends the loop
+    assert len([p for p in fake.paths() if p.endswith("/history")]) == 2
 
 
 @pytest.mark.asyncio
@@ -309,6 +378,39 @@ async def test_handle_group_members_write_blocked(monkeypatch):
     out = json.loads(await act._handle_group_members(
         {"group_id": "g@chatroom", "action": "remove", "member_wxids": ["x"]}))
     assert "error" in out and "WEKIT_ENABLE_WRITE_ACTIONS" in out["error"]
+
+
+@pytest.mark.asyncio
+async def test_send_voice_temp_files_are_unique_and_cleaned(monkeypatch, tmp_path):
+    # Two voice messages sent at once must not write over each other's audio —
+    # which a temp name derived from the text would do for identical text.
+    monkeypatch.setenv("WEKIT_BASE_URL", "http://phone:3001")
+    monkeypatch.setenv("WEKIT_TOKEN", "T")
+    made: list[str] = []
+
+    async def fake_tts(text, voice, out_path):
+        made.append(out_path)
+        await asyncio.to_thread(Path(out_path).write_bytes, b"ID3fake")
+
+    sent: list[str] = []
+
+    async def fake_send_voice(self, conv_id, mp3_path, **kw):
+        sent.append(mp3_path)
+        return {"ok": True, "durationMs": 1}
+
+    monkeypatch.setattr(act, "_edge_tts_to_mp3", fake_tts)
+    monkeypatch.setattr(act.WeKitActions, "send_voice", fake_send_voice)
+
+    await asyncio.gather(*[
+        act._handle_send_voice({"conv_id": "wxid_a", "text": "same words"})
+        for _ in range(2)
+    ])
+
+    assert len(set(made)) == 2, f"temp files collided: {made}"
+    assert sorted(sent) == sorted(made)
+    # and neither is left behind
+    left = await asyncio.to_thread(lambda: [p for p in made if Path(p).exists()])
+    assert left == []
 
 
 def test_register_tools_registers_all():

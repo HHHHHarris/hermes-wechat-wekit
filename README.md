@@ -107,7 +107,8 @@ Also exempt WeChat from battery optimisation / doze on that device, so the OS do
 
 ```bash
 mkdir -p ~/.hermes/plugins/wechat-wekit
-cp plugin/__init__.py plugin/adapter.py plugin/plugin.yaml ~/.hermes/plugins/wechat-wekit/
+cp plugin/__init__.py plugin/adapter.py plugin/actions.py plugin/plugin.yaml \
+   ~/.hermes/plugins/wechat-wekit/
 ```
 
 Enable it in `~/.hermes/config.yaml`:
@@ -259,9 +260,9 @@ Replies are sent as plain text — WeChat renders no markdown. The registered `m
 ## Action tools
 
 Beyond the message stream, the plugin registers seven tools the agent can call
-during a conversation. They land in the `hermes-wechat-wekit` toolset, which
-Hermes derives from the platform key and enables for this platform on its own —
-there is no config to edit.
+during a conversation. They land in the `hermes-wechat-wekit` toolset — a name
+chosen so that Hermes, which derives a plugin platform's default toolset as
+`hermes-{platform key}`, enables them for WeChat sessions with no config to edit.
 
 | Tool | What it does | Write gate |
 |---|---|---|
@@ -284,6 +285,17 @@ account cannot be quietly reshaped by a prompt injected into a message.
 with `text`; with `audio_path` it has no extra dependency. The mp3 → SILK
 conversion runs on the phone, in WeKit.
 
+**These tools are not confined to WeChat sessions.** Hermes treats a plugin
+toolset it has not been told about as on-by-default for *every* platform, so a
+CLI or Telegram session gets all seven as well — verified, not assumed. Usually
+that is welcome (asking from the CLI to pull a WeChat conversation is a
+reasonable thing to want), but it does mean the boundary is the write gate and
+your own prompt, not the channel you happen to be in: `wechat_send_voice` and
+`wechat_send_video` take a free-form `conv_id` and are **not** gated, so on any
+platform the model can send audio or video to any contact. `WEKIT_ALLOWED_USERS`
+does not constrain this — it filters inbound only. Run `hermes tools` and turn
+the toolset off for the platforms that should not have it if that matters to you.
+
 ### Labels as the allow-list
 
 `WEKIT_ALLOWED_USERS` is a list of wxids in a file. `WEKIT_ALLOWED_LABEL` is the
@@ -295,8 +307,10 @@ taps in WeChat rather than an `.env` edit and a restart.
 Two properties worth knowing: the merge is additive, so anything in
 `WEKIT_ALLOWED_USERS` still applies; and a label that fails to resolve is
 logged and ignored, never treated as "allow everyone" — a lookup failure must
-not silently open the account up. Membership is read once at connect, so a
-contact added to the label afterwards takes effect at the next reconnect.
+not silently open the account up. Membership is re-read on connect and
+then roughly every ten minutes, so granting or revoking on the phone takes
+effect on its own — no restart, and no HTTP call on the path an inbound
+message travels.
 
 **Create the label in WeChat first** (Me → Contacts → Tags). WeKit can read
 labels and assign existing ones, but has no endpoint for creating one — WeChat
