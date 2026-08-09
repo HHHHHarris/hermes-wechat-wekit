@@ -202,9 +202,35 @@ async def test_contacts_by_label_returns_strings():
 @pytest.mark.asyncio
 async def test_set_contact_labels_body():
     fake = FakeWeKit()
+    fake.route("GET", "/api/labels",
+               [{"labelId": 1, "labelName": "vip"}, {"labelId": 2, "labelName": "work"}])
     await actions_with(fake).set_contact_labels("wxid_a", ["vip", "work"])
     body = json.loads(fake.find("POST", "/contacts/wxid_a/labels").content)
     assert body == {"labels": ["vip", "work"]}
+
+
+@pytest.mark.asyncio
+async def test_set_contact_labels_rejects_unknown_label():
+    # WeChat silently skips a label it cannot resolve and still answers 200, so
+    # an unknown name must be caught here rather than reported as success.
+    fake = FakeWeKit()
+    fake.route("GET", "/api/labels", [{"labelId": 1, "labelName": "vip"}])
+    with pytest.raises(act.WeKitActionError) as exc:
+        await actions_with(fake).set_contact_labels("wxid_a", ["nope"])
+    assert "nope" in str(exc.value)
+    # and it must not have sent the doomed write
+    assert not any(r.url.path.endswith("/labels") and r.method == "POST"
+                   for r in fake.requests)
+
+
+@pytest.mark.asyncio
+async def test_set_contact_labels_empty_clears_without_lookup():
+    # Clearing a contact's labels is always valid — no label list to check.
+    fake = FakeWeKit()
+    await actions_with(fake).set_contact_labels("wxid_a", [])
+    body = json.loads(fake.find("POST", "/contacts/wxid_a/labels").content)
+    assert body == {"labels": []}
+    assert not any(r.method == "GET" for r in fake.requests)
 
 
 # ── error surface ──────────────────────────────────────────────────────────

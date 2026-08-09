@@ -339,10 +339,30 @@ class WeKitActions:
         return [str(x) for x in res] if isinstance(res, list) else []
 
     async def set_contact_labels(self, wx_id: str, labels: list[str]) -> dict:
+        """Replace a contact's label set.
+
+        WeChat only accepts labels that already exist: inside WeKit, a name it
+        cannot resolve to an id is skipped with a log line, and the endpoint
+        still answers 200 — so an unknown name would look like it worked and
+        silently do nothing. Names are therefore checked against the label list
+        first, and an unknown one is an error rather than a no-op. WeKit exposes
+        no way to create a label, so a new one has to be made in WeChat itself.
+        """
+        labels = list(labels)
+        if labels:
+            known = {str(lbl.get("labelName") or "") for lbl in await self.list_labels()}
+            missing = [name for name in labels if name not in known]
+            if missing:
+                raise WeKitActionError(
+                    f"no such WeChat label: {', '.join(missing)}. "
+                    f"Existing labels: {', '.join(sorted(known)) or '(none)'}. "
+                    "Labels can only be created in the WeChat app itself "
+                    "(Me -> Contacts -> Tags); WeKit exposes no endpoint for it."
+                )
         await self._request(
-            "POST", f"contacts/{wx_id}/labels", json_body={"labels": list(labels)}
+            "POST", f"contacts/{wx_id}/labels", json_body={"labels": labels}
         )
-        return {"ok": True, "wxId": wx_id, "labels": list(labels)}
+        return {"ok": True, "wxId": wx_id, "labels": labels}
 
 
 # ── env / gating helpers ───────────────────────────────────────────────────
@@ -504,8 +524,10 @@ LABELS_SCHEMA = {
     "description": (
         "Manage WeChat contact labels (标签/groups). action=list lists labels; "
         "action=members lists the wxIds carrying a label (use this to drive the "
-        "agent's allow-list); action=set assigns a contact's full label set "
-        "(set is gated behind WEKIT_ENABLE_WRITE_ACTIONS)."
+        "agent's allow-list); action=set replaces a contact's full label set "
+        "(gated behind WEKIT_ENABLE_WRITE_ACTIONS). Labels must already exist — "
+        "they can only be created in the WeChat app itself, so 'set' with an "
+        "unknown name fails rather than creating it."
     ),
     "parameters": {
         "type": "object",
