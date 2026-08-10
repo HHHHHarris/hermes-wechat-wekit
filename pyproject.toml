@@ -2,7 +2,13 @@
 name = "hermes-wechat-wekit"
 version = "0.1.0"
 description = "WeChat platform plugin for Hermes Agent, driving the real WeChat app through the WeKit module on a rooted Android phone"
-readme = "README.md"
+# 打包元数据用英文版: 这个字段只在把包发到软件源时充当 long_description, 面向的是
+# 国际读者。GitHub 仓库首页读的是 README.md, 不受影响, 所以中文仍然是门面。
+#
+# The English edition here on purpose: this field only becomes a package index's
+# long_description, whose audience is international. GitHub's landing page reads
+# README.md regardless, so Chinese stays the front door.
+readme = "README.en.md"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }
 dependencies = ["httpx>=0.24"]

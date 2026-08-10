@@ -1,28 +1,30 @@
-# Phone Setup
+# 手机配置
 
-This is the hard part. Everything else in this project — the Hermes plugin, the transport, the watchdog — is ordinary software. This page is where you turn a stock Android phone into a WeChat host that a program can talk to: unlock the bootloader, root it, install an Xposed framework, load the WeKit module into WeChat, and turn on WeKit's HTTP + MCP server.
+English: [phone-setup.en.md](phone-setup.en.md)
 
-Budget an evening. Several steps wipe the device or require a reboot, and one step (the first DexKit scan) is just minutes of waiting.
+难的部分在这里. 这个项目里其余的东西, Hermes 插件, 传输层, watchdog, 都只是普通软件. 这一页要做的, 是把一台原厂安卓手机改造成一个程序能对话的微信宿主: 解锁 bootloader, root, 装一个 Xposed 框架, 把 WeKit 模块加载进微信, 再打开 WeKit 的 HTTP + MCP server.
 
----
-
-## Read this before you buy hardware or install anything
-
-**Use a dedicated secondary WeChat account. This is not optional.**
-
-- Automating a WeChat account violates WeChat's Terms of Service.
-- A WeChat ban also freezes WeChat Pay and any balance attached to the account. Do not put your primary identity, your payment method, or money you care about behind this.
-- **WeChat allows one active mobile session per account.** If you log the agent's phone into *your* account, your own phone gets kicked off. A separate account is a structural requirement, not just a safety measure.
-- WeChat does actively check for Xposed. Publicly documented enforcement against Xposed modules specifically is mostly historical (the last well-evidenced mass ban wave hit a *different* technique — local-database decryption — in March 2026), but "no recent wave" is not a guarantee. Assume the account can disappear.
-- This project is for research and personal use. Never use it for bulk, unsolicited, or commercial messaging.
-
-**Understand what you are giving up on the phone:** unlocking the bootloader wipes the device, trips hardware attestation, and will make some banking / DRM apps refuse to run. Use a phone you are willing to dedicate to this.
-
-> ⚠️ **Know the channel's central limitation before you invest an evening in it.** Inbound delivery is **edge-triggered**: WeKit's `wait-for-new-message` registers a database listener only for the duration of each call and removes it when the call returns. There is no queue, no buffer, no cursor. Any message that arrives while the poll loop is *between* calls is **lost permanently and cannot be recovered** — this is upstream behaviour, not something this plugin can fix. Ordinary back-and-forth conversation is reliable; rapid-fire bursts and any gap (gateway restart, error backoff) can drop messages. Read the architecture notes before you depend on this for anything.
+预算一个晚上. 有好几步会清空设备或者需要重启, 还有一步 (第一次 DexKit 扫描) 纯粹就是干等几分钟.
 
 ---
 
-## What you are building on the phone side
+## 买硬件或者装任何东西之前先读这一节
+
+**必须用一个专用的微信小号. 这不是可选项.**
+
+- 自动化一个微信账号违反微信服务条款.
+- 微信封号会连带冻结微信支付以及账号里的余额. 不要把你的主身份, 你的支付方式, 或者你在乎的钱, 压在这套东西后面.
+- **微信一个账号同时只允许一个活动的手机会话.** 如果你把 agent 的手机登进*你自己*的账号, 你自己的手机就会被踢下线. 用独立账号是结构上的硬性要求, 不只是一条安全建议.
+- 微信确实会主动检测 Xposed. 有公开记录的, 专门针对 Xposed 模块的处罚基本都是历史事件 (最近一次证据确凿的大规模封号潮打的是*另一种*技术, 本地数据库解密, 时间是 2026 年 3 月), 但"最近没有一波"不等于保证. 就当这个账号随时可能消失.
+- 这个项目是给研究和个人使用的. 绝对不要拿它做批量群发, 未经许可的骚扰, 或者商业消息.
+
+**想清楚你在这台手机上放弃了什么:** 解锁 bootloader 会清空设备, 会让硬件 attestation 失败, 并且会让一部分银行 / DRM 应用直接拒绝运行. 用一台你愿意专门拿来干这件事的手机.
+
+> ⚠️ **在往里投进一个晚上之前, 先知道这条通道最核心的限制.** 入站是**边沿触发**的: WeKit 的 `wait-for-new-message` 只在单次调用期间注册一个数据库监听器, 调用一返回就把它摘掉. 没有队列, 没有缓冲, 没有游标. 任何在 poll 循环*两次调用之间*到达的消息都会**永久丢失, 而且找不回来**, 这是上游的行为, 不是本插件能修的. 普通的一来一回对话是可靠的; 但连珠炮式的密集消息, 以及任何空档 (gateway 重启, 出错退避) 都可能丢消息. 在你打算依赖它做任何事情之前, 先读架构文档.
+
+---
+
+## 手机侧最终要搭出来的东西
 
 ```
 ┌─ Android phone (rooted) ───────────────────────────────┐
@@ -46,108 +48,108 @@ Budget an evening. Several steps wipe the device or require a reboot, and one st
 
 ---
 
-## 0. Prerequisites
+## 0. 前置条件
 
-| Item | Requirement | Notes |
+| 项目 | 要求 | 备注 |
 |---|---|---|
-| Phone | Android 9+, **bootloader must be unlockable** | See §1 — the step that kills most attempts |
-| Reference device | Pixel 9 Pro (`caiman`), Android 16 | The flow below is what was verified there |
-| Computer | Windows / macOS / Linux with `adb` + `fastboot` | Android SDK platform-tools |
-| Root | Magisk (30.x verified) with **Zygisk enabled** | §3 |
-| Xposed framework | Vector on modern Android; LSPosed only on older releases | §4 |
-| WeChat | **Official** APK, version **8.0.72** | §5 |
-| WeChat account | A dedicated secondary account | Not your main one |
-| Module | [github.com/Ujhhgtg/WeKit](https://github.com/Ujhhgtg/WeKit) | §6 |
+| 手机 | Android 9+, **bootloader 必须能解锁** | 见 §1, 大多数尝试都死在这一步 |
+| 参考设备 | Pixel 9 Pro (`caiman`), Android 16 | 下面这套流程就是在它上面验证过的 |
+| 电脑 | Windows / macOS / Linux, 带 `adb` + `fastboot` | Android SDK platform-tools |
+| Root | Magisk (实测 30.x), 并且**开启 Zygisk** | §3 |
+| Xposed 框架 | 较新的安卓上用 Vector; LSPosed 只适合更老的版本 | §4 |
+| 微信 | **官方** APK, 版本 **8.0.72** | §5 |
+| 微信账号 | 一个专用小号 | 不要用你的主号 |
+| 模块 | [github.com/Ujhhgtg/WeKit](https://github.com/Ujhhgtg/WeKit) | §6 |
 
-WeKit is a third-party project with, in practice, a single maintainer and no tagged releases. This plugin only calls its HTTP API; it does not vendor or redistribute any WeKit code. Everything from §5 onward depends on that upstream project continuing to exist and continuing to support your WeChat version.
+WeKit 是一个第三方项目, 实际上是单人维护, 而且从来没打过 tag 的 release. 本插件只调用它的 HTTP API, 不内置也不再分发任何 WeKit 代码. 从 §5 开始的每一步, 都依赖那个上游项目继续存在, 并且继续支持你手上这个微信版本.
 
 ---
 
-## 1. Device prerequisites: can this phone even be unlocked?
+## 1. 设备前提: 这台手机到底能不能解锁
 
-**Check this before anything else.** On a carrier-locked unit the "OEM unlocking" toggle is greyed out and **there is nothing you can do about it in software** — the restriction lives at the bootloader level and reflashing stock firmware does not clear it.
+**这件事要排在所有事情之前确认.** 在运营商锁死的机器上, "OEM unlocking" 开关是灰的, 而且**在软件层面你什么都做不了**: 这个限制活在 bootloader 层, 重刷官方固件也清不掉.
 
-On the device:
+在设备上:
 
-1. Settings → About phone → tap *Build number* seven times to enable Developer options.
-2. Settings → System → Developer options → look at **OEM unlocking**.
+1. 设置 → 关于手机 → 连点*版本号*七次, 打开开发者选项.
+2. 设置 → 系统 → 开发者选项 → 看 **OEM unlocking** 这一项.
 
-| What you see | Meaning |
+| 你看到的 | 含义 |
 |---|---|
-| Toggle is available (on or off) | Good — proceed |
-| Greyed out, subtitle *"Connect to the internet or contact your carrier"* | **Carrier-locked.** That exact subtitle is the tell. Dead end for this device |
-| Greyed out, some other subtitle | Could be no network, a device-owner/MDM profile, or a locked build — investigate, but carrier lock is the usual answer |
+| 开关可点 (开着或关着都行) | 好, 继续 |
+| 灰色, 副标题是*"Connect to the internet or contact your carrier"* (中文系统上显示为"请连接到互联网或与您的运营商联系") | **运营商锁.** 就是这句副标题, 它是专属判据. 这台设备到此为止 |
+| 灰色, 但副标题是别的 | 可能是没网, 可能是 device-owner/MDM 配置, 也可能是被锁死的系统构建. 值得查一下, 但答案通常还是运营商锁 |
 
-The authoritative machine-readable check is from the bootloader:
+机器可读的权威判据要从 bootloader 里拿:
 
 ```bash
 adb reboot bootloader
 fastboot flashing get_unlock_ability     # 1 = this device can be unlocked
 ```
 
-(On builds that expose it, `adb shell dumpsys oem_lock` reports the underlying `isOemUnlockAllowedByCarrier` flag; `false` there is the carrier lock.)
+(在暴露了这个接口的系统构建上, `adb shell dumpsys oem_lock` 会报出底层的 `isOemUnlockAllowedByCarrier` 标志位; 那里是 `false` 就是运营商锁.)
 
-Two things that are commonly and wrongly believed:
+有两件事被广泛相信, 但其实是错的:
 
-- **SIM unlock ≠ OEM unlock.** A device whose SIM lock has been released — it makes calls and uses data on any carrier — can still be OEM-locked forever. Advice from 2023 or earlier saying "get it SIM-unlocked and OEM unlocking lights up" no longer holds for the major US carriers. This was re-confirmed the hard way on a carrier unit: working calls and data, OEM unlocking still greyed out.
-- **Reflashing the factory image does not remove a carrier lock.**
+- **SIM 解锁 ≠ OEM 解锁.** 一台已经解了 SIM 锁的设备, 也就是插任何运营商的卡都能打电话上网的设备, 照样可能永远 OEM 锁死. 2023 年及更早那种"先解 SIM 锁, OEM unlocking 就会点亮"的说法, 对美国几大运营商已经不成立了. 这一条是在一台运营商渠道机上用惨痛方式复验过的: 电话和数据都正常, OEM unlocking 依然是灰的.
+- **重刷官方厂包并不能去掉运营商锁.**
 
-**Recommendation: buy a Google Store (unlocked) Pixel.** Carrier-channel units of the same model may or may not be unlockable, and you find out only after the phone is in your hand.
+**建议: 直接买 Google Store 的无锁版 Pixel.** 同一个型号的运营商渠道机可能能解也可能不能解, 而你只有等手机拿到手才知道.
 
 ---
 
-## 2. Unlock the bootloader
+## 2. 解锁 bootloader
 
-> ⚠️ **This wipes the device.** Do it before you log any account into the phone.
+> ⚠️ **这一步会清空设备.** 要在往手机里登任何账号之前就做掉.
 
-1. Developer options → enable **OEM unlocking** *and* **USB debugging**.
-2. Reboot to the bootloader and unlock:
+1. 开发者选项 → 打开 **OEM unlocking** *以及* **USB debugging**.
+2. 重启进 bootloader 并解锁:
 
 ```bash
 adb reboot bootloader
 fastboot flashing unlock          # confirm on the device with the volume/power keys
 ```
 
-3. The device wipes and reboots. Walk through setup again, re-enable Developer options and USB debugging.
+3. 设备会清空并重启. 重新走一遍开机引导, 再次打开开发者选项和 USB debugging.
 
-Verify the *real* state at any later point with:
+之后任何时候想确认*真实*状态, 用这条:
 
 ```bash
 fastboot getvar unlocked          # ground truth
 ```
 
-Note for later: once you install Magisk modules such as Play Integrity spoofers, `getprop ro.boot.flash.locked`, the vbmeta state, and `verifiedbootstate` may all report *locked / green* because a module rewrote them. Those properties stop being evidence of anything. `fastboot getvar unlocked` is the only reliable check.
+先记一件后面会用到的事: 一旦你装了 Play Integrity 伪装之类的 Magisk 模块, `getprop ro.boot.flash.locked`, vbmeta 状态, 以及 `verifiedbootstate` 可能全都报成*locked / green*, 因为有模块把它们改写了. 这些属性从此不再能证明任何事. `fastboot getvar unlocked` 是唯一可信的检查.
 
 ---
 
-## 3. Root: patch the right partition
+## 3. Root: 补丁要打对分区
 
-**On Pixel 9-family devices (and generally anything that shipped with Android 13+), you patch `init_boot.img`, NOT `boot.img`.** Patching `boot.img` on these devices leaves you with a phone that either bootloops or boots without root, and you will waste an hour before you notice.
+**在 Pixel 9 系列设备上 (以及一般来说, 所有出厂即 Android 13+ 的设备上), 你要打补丁的是 `init_boot.img`, 不是 `boot.img`.** 在这些设备上给 `boot.img` 打补丁, 结果要么是循环重启, 要么是能开机但没有 root, 而你会在发现之前先浪费掉一个小时.
 
-Quick test: if the factory image contains an `init_boot.img`, that is the partition Magisk patches.
+快速判断: 厂包里如果有 `init_boot.img`, 那它就是 Magisk 要打补丁的那个分区.
 
-1. **Install the Magisk APK on the phone.**
+1. **在手机上装 Magisk APK.**
 
-2. **Download the official factory image** for your exact device and build (Settings → About phone → Build number). Verify its SHA-256 against the checksum published next to the download. Do not skip this.
+2. **下载官方厂包**, 必须对应你这台设备和这个确切的构建号 (设置 → 关于手机 → 版本号). 拿下载页旁边公布的校验值核对它的 SHA-256. 别跳过这一步.
 
-3. **Extract the nested image zip** and pull out `init_boot.img`. On Pixel 9-family this file is roughly 8 MB — if what you extracted is tens of MB, you grabbed `boot.img`:
+3. **解开里层嵌套的 image zip**, 取出 `init_boot.img`. 在 Pixel 9 系列上这个文件大约 8 MB, 如果你解出来的是几十 MB, 那你抓错了, 抓到的是 `boot.img`:
 
 ```bash
 unzip <device>-<build>-factory-*.zip
 unzip image-<device>-<build>.zip init_boot.img
 ```
 
-4. **Back up the stock `init_boot.img`.** You need it to un-root, to take an OTA cleanly, or to recover. Keep one per build you run.
+4. **备份原厂的 `init_boot.img`.** 取消 root, 干净地接收 OTA, 或者救回设备, 都要用到它. 你跑过的每一个构建都各留一份.
 
-5. **Patch it with the Magisk app:**
+5. **用 Magisk 应用给它打补丁:**
 
 ```bash
 adb push init_boot.img /sdcard/Download/
 ```
 
-Open Magisk → **Install** → *Select and Patch a File* → pick `/sdcard/Download/init_boot.img`. Magisk writes `magisk_patched-XXXXX_yyyyy.img` next to it.
+打开 Magisk → **Install** → *Select and Patch a File* → 选 `/sdcard/Download/init_boot.img`. Magisk 会在同目录写出 `magisk_patched-XXXXX_yyyyy.img`.
 
-6. **Pull it back and flash it:**
+6. **把它拉回来然后刷进去:**
 
 ```bash
 adb pull /sdcard/Download/magisk_patched-XXXXX_yyyyy.img
@@ -156,36 +158,36 @@ fastboot flash init_boot magisk_patched-XXXXX_yyyyy.img
 fastboot reboot
 ```
 
-7. Open the Magisk app — it should report an installed Magisk version, not "N/A".
+7. 打开 Magisk 应用, 它应该报出一个已安装的 Magisk 版本号, 而不是 "N/A".
 
-8. **Enable Zygisk** (Magisk → Settings → Zygisk) and reboot. The Xposed framework in §4 requires it.
+8. **打开 Zygisk** (Magisk → Settings → Zygisk) 然后重启. §4 里的 Xposed 框架需要它.
 
-**Two gotchas worth knowing now:**
+**有两个坑现在就该知道:**
 
-- **An OTA update overwrites `init_boot` and removes root.** After any system update you must re-patch and re-flash, using the *new* build's `init_boot.img`. The channel stays down until you do.
-- **`adb shell su` may be rejected instantly** with `su: request rejected (2000)`. On recent Android, background-activity-start restrictions can stop Magisk from ever showing the authorization dialog; the request times out, is recorded as *deny* for the Shell UID, and that stored policy wins from then on — including after you set the default response to "Grant". The fix is **Magisk app → Superuser tab → enable the `[SharedUID] Shell` entry**, not changing the automatic-response setting. You do not strictly need `adb su` for this project (the Magisk and Vector apps can do everything from their own UIs), but you will want it while debugging.
+- **OTA 更新会覆盖 `init_boot`, 把 root 干掉.** 任何系统更新之后, 你都必须用*新*构建的 `init_boot.img` 重新打补丁, 重新刷. 在你做完之前, 这条通道一直是断的.
+- **`adb shell su` 可能被秒拒**, 报 `su: request rejected (2000)`. 在较新的安卓上, 后台启动 activity 的限制会让 Magisk 根本弹不出授权框; 请求超时, 被记成 Shell UID 上的一条 *deny*, 从此这条已存策略永远优先, 哪怕你后来把默认响应改成 "Grant" 也没用. 正确的修法是 **Magisk 应用 → Superuser 标签页 → 打开 `[SharedUID] Shell` 那一项**, 而不是去改自动响应的设置. 这个项目严格来说不需要 `adb su` (Magisk 和 Vector 应用在各自的界面里就能做完所有事), 但排障的时候你会想要它.
 
 ---
 
-## 4. Install an Xposed framework
+## 4. 装一个 Xposed 框架
 
-WeKit is an Xposed module, so it needs a framework to load it, and the framework needs Zygisk.
+WeKit 是一个 Xposed 模块, 所以它需要一个框架来加载它, 而这个框架需要 Zygisk.
 
-| Framework | Status |
+| 框架 | 状态 |
 |---|---|
-| **Vector** (`JingMatrix/Vector`) | The maintained LSPosed successor and what the reference deployment runs (v2.2 on Android 16) |
-| **LSPosed** (`LSPosed/LSPosed`) | Official releases stopped at v1.9.2 (2023) and do not cover Android 16. Fine only on older Android |
-| **NPatch** (rootless APK patching) | **Does not work for WeKit.** The patched WeChat installs and logs in, but the module never loads: `libdexkit.so` is not loaded, so WeKit's hooks never attach and :3001 never comes up. Verified first-hand. If you have root, do not go down this road |
+| **Vector** (`JingMatrix/Vector`) | 仍在维护的 LSPosed 后继者, 参考部署跑的就是它 (Android 16 上的 v2.2) |
+| **LSPosed** (`LSPosed/LSPosed`) | 官方 release 停在 v1.9.2 (2023), 覆盖不到 Android 16. 只在更老的安卓上还能用 |
+| **NPatch** (免 root 的 APK 修补) | **对 WeKit 不管用.** 修补版微信能装, 也能登录, 但模块从来没被加载: `libdexkit.so` 没有加载, 于是 WeKit 的 hook 一个都挂不上, :3001 也永远起不来. 一手实测. 如果你有 root, 别往这条路上走 |
 
-Install the framework as a Magisk module. The easiest route — and the one that sidesteps the `su`-rejection trap above — is the **Magisk app → Modules → Install from storage**, pointed at the framework's release zip. From a root shell the equivalent is:
+把框架当成 Magisk 模块来装. 最省事的路子, 同时也能绕开上面那个 `su` 被拒的陷阱, 是走 **Magisk 应用 → Modules → Install from storage**, 指向框架的 release zip. 在 root shell 里的等价做法是:
 
 ```
 magisk --install-module /sdcard/Download/Vector-<version>.zip
 ```
 
-**Reboot.**
+**重启.**
 
-Then install the framework's **manager app**. Vector ships its APK inside its module directory (`/data/adb/modules/zygisk_vector/manager.apk`). SELinux blocks reading files under `/data/adb` from the `su` domain, so copy it out with SELinux briefly permissive and put SELinux straight back. Run these **on the device**, in a root shell:
+然后装框架的**管理器应用**. Vector 把自己的 APK 放在模块目录里 (`/data/adb/modules/zygisk_vector/manager.apk`). SELinux 禁止 `su` 域读 `/data/adb` 下的文件, 所以要把 SELinux 短暂切成 permissive 把它拷出来, 然后立刻切回去. 下面这些要**在设备上**的 root shell 里跑:
 
 ```bash
 adb shell
@@ -197,9 +199,9 @@ pm install /data/local/tmp/manager.apk
 exit
 ```
 
-Open the manager (Vector's package is `org.matrix.vector.manager`). It should report the framework as **active**; you should also see `vectord` and `zygiskd64` running. If it says the framework is not installed, Zygisk is probably off — check Magisk → Settings and reboot.
+打开管理器 (Vector 的包名是 `org.matrix.vector.manager`). 它应该显示框架处于 **active**; 你还应该能看到 `vectord` 和 `zygiskd64` 在跑. 如果它说框架没安装, 那多半是 Zygisk 没开, 去 Magisk → Settings 看一眼然后重启.
 
-While you are working on the device, stop the screen from sleeping mid-flow:
+在设备上折腾的这段时间, 别让屏幕在流程中间睡过去:
 
 ```bash
 adb shell svc power stayon true
@@ -207,40 +209,40 @@ adb shell svc power stayon true
 
 ---
 
-## 5. Install a supported WeChat, then stop it updating
+## 5. 装一个受支持的微信版本, 然后掐掉它的更新
 
-WeKit hooks specific WeChat internals and is version-sensitive.
+WeKit hook 的是微信内部的具体实现, 对版本敏感.
 
-- **Target WeChat 8.0.72.** That is the highest build in WeKit's version table. The project's docs mention newer versions, but the download links for those resolve to the same version code, so treat anything above 8.0.72 as unverified.
-- Install the **official** WeChat APK — not a patched or modified one. (With root + Xposed you inject into stock WeChat; you do not need a repackaged APK.)
-- **Log in with the dedicated secondary account now**, before the module is active, so the first login is clean.
-- **Turn off automatic updates for WeChat** wherever you installed it from. An update to an unsupported version silently breaks the hooks.
-- **Disable WeChat's hot-update (tinker) mechanism** with WeKit's own setting as soon as the module is running (§7). This matters: a hot-patched WeChat can cause the module to *silently fail to load*, and the only documented cleanup is deleting the patch directory by hand with an on-device file manager — not something you can drive over adb.
+- **目标是微信 8.0.72.** 这是 WeKit 版本表里最高的一个. 项目文档里提到过更新的版本, 但那些下载链接解析出来的版本号其实还是同一个, 所以 8.0.72 以上的一律当作未经验证.
+- 装**官方**微信 APK, 不要装被修补或改造过的. (有了 root + Xposed, 你是注入进原版微信, 不需要重打包的 APK.)
+- **现在就用那个专用小号登录**, 趁模块还没生效, 让第一次登录是干净的.
+- **在你装微信的那个渠道里关掉它的自动更新.** 一旦更新到不受支持的版本, hook 会静默失效.
+- 模块一跑起来, 就用 WeKit 自己的开关**关掉微信的热更新 (tinker) 机制** (§7). 这一条很重要: 被热补丁过的微信会让模块*静默加载失败*, 而目前有记录的唯一清理办法, 是用手机上的文件管理器手动删掉补丁目录, 这件事你没法用 adb 远程驱动.
 
 ---
 
-## 6. Install the WeKit module and scope it to WeChat
+## 6. 装 WeKit 模块并把作用域限定到微信
 
-Get WeKit from **[github.com/Ujhhgtg/WeKit](https://github.com/Ujhhgtg/WeKit)**.
+从 **[github.com/Ujhhgtg/WeKit](https://github.com/Ujhhgtg/WeKit)** 获取 WeKit.
 
-Be aware of how it is distributed: **the repository publishes no releases.** Builds come from CI artifacts (which require a GitHub login and expire) or the project's community channels. Verify what you install; you are about to hand it your WeChat session.
+注意它的分发方式: **这个仓库不发布 release.** 构建产物来自 CI artifact (需要 GitHub 登录, 而且会过期) 或者项目的社群渠道. 装之前先核实你装的到底是什么, 你马上要把自己的微信会话交到它手里.
 
-Do not use the `Johnny520/wcx` fork — it is a rename of WeKit with a higher minimum Android version and nothing maintaining it.
+不要用 `Johnny520/wcx` 这个 fork, 它就是 WeKit 改了个名, 最低安卓版本要求更高, 而且没人在维护.
 
-Then:
+然后:
 
-1. Install the WeKit APK (`adb install -g wekit-standard.apk` grants its permissions up front).
-2. Open the **Vector/LSPosed manager → Modules → WeKit**.
-3. Turn the module **on** and set its **scope to WeChat only**. Do not scope it to other apps. Apply.
-4. **Force-close WeChat and reopen it** so the framework injects into a fresh process. Until you do this, the module is enabled but not loaded.
+1. 装 WeKit APK (`adb install -g wekit-standard.apk` 会一次性把权限全授上).
+2. 打开 **Vector/LSPosed 管理器 → Modules → WeKit**.
+3. 把模块**打开**, 并且**作用域只勾微信**. 不要勾任何其他应用. 应用设置.
+4. **强制关闭微信再重新打开**, 让框架注入到一个全新的进程里. 在你做这一步之前, 模块的状态是已启用但没有加载.
 
-Confirm the injection actually happened — do not assume. Right after WeChat starts:
+确认注入真的发生了, 不要靠猜. 微信刚启动之后立刻:
 
 ```bash
 adb logcat -d | grep -iE "vector|xposed|wekit|dexkit"
 ```
 
-You are looking for lines equivalent to these (exact wording varies by version):
+你要找的是类似下面这样的行 (具体措辞随版本变化):
 
 ```
 Vector: Loading Vector/Xposed for com.tencent.mm
@@ -249,183 +251,183 @@ WeKit: hooking Application.attachBaseContext
 Load libdexkit.so ... ok
 ```
 
-If you see none of these, go to §Troubleshooting → "the module is enabled but nothing is hooked".
+如果这些一行都没有, 去 §排障 → "模块已启用, 但什么都没被 hook".
 
-> **After this one-time force-close, stop force-stopping WeChat.** See the red warning in Troubleshooting — it is the single easiest way to break a working setup.
+> **这一次性的强制关闭做完之后, 就别再强制停止微信了.** 见排障里那条红色警告, 那是把一套能跑的环境搞坏的最简单方式.
 
 ---
 
-## 7. Enable WeKit's API + MCP server
+## 7. 打开 WeKit 的 API + MCP server
 
-Inside **WeChat itself**, WeKit adds its own settings entry (the exact label depends on module version and language — look for WeKit's settings / features screen, then the "API + MCP server" item).
+WeKit 会在**微信内部**加一个属于它自己的设置入口 (具体标签取决于模块版本和语言, 找 WeKit 的设置 / 功能页面, 然后找 "API + MCP server" 那一项).
 
-1. **Set the bearer token.** WeKit's built-in default is the placeholder literal `your_token`. **Change it.** Anything that can reach the port and knows the token can read your messages and send as you.
-2. **Set the port to `3001`** (the default, and what this project's docs and scripts assume).
-3. Turn the feature **on**.
+1. **设置 bearer token.** WeKit 内置的默认值是占位符字面量 `your_token`. **一定要改掉.** 任何能连到这个端口并且知道 token 的东西, 都能读你的消息, 并且以你的身份发消息.
+2. **端口设成 `3001`** (这是默认值, 也是本项目的文档和脚本假定的值).
+3. 把这个功能**打开**.
 
-While you are in WeKit's settings, also enable its options for:
+还在 WeKit 设置里的时候, 顺手把这两个选项也打开:
 
-- **disabling WeChat's hot update / tinker** (§5), and
-- **hiding Xposed from WeChat** (anti-detection).
+- **关闭微信的热更新 / tinker** (§5), 以及
+- **对微信隐藏 Xposed** (反检测).
 
-Those three — a real token, hot-update off, Xposed hidden — are the deployment switches you should never skip.
+这三项, 一个真 token, 关热更新, 隐藏 Xposed, 是部署时永远不该跳过的开关.
 
-**Security facts about this server:**
+**关于这个 server 的几条安全事实:**
 
 | | |
 |---|---|
-| Auth | A single static bearer token. That is the entire access-control model |
-| Transport | Plain HTTP. The token and every message body cross your LAN in cleartext |
-| Bind address | The server binds **all interfaces (0.0.0.0)** and this is not configurable | 
+| 鉴权 | 一个静态 bearer token. 这就是它全部的访问控制模型 |
+| 传输 | 明文 HTTP. token 和每一条消息内容都以明文穿过你的局域网 |
+| 监听地址 | server 绑定的是**所有网卡 (0.0.0.0)**, 而且这一点不可配置 |
 
-Treat :3001 as a LAN-only service. Never port-forward it to the internet, and if you use the router DNAT transport, make sure the interface you expose it on faces a private network you control — never an internet-facing WAN. Use a long random token.
+把 :3001 当成一个只在局域网内提供的服务. 绝对不要把它端口转发到公网; 如果你用路由器 DNAT 那套传输方式, 要确认你暴露它的那个接口面向的是你自己掌控的私有网络, 绝不能是朝向公网的 WAN. token 用长的随机串.
 
-The feature toggle **persists across reboots**, and the server starts automatically whenever WeChat starts with the module loaded. There is **no separate "start on boot" option** in the dialog (it exposes only the token and the port), so keeping the channel up is equivalent to keeping *WeChat* running — see §10.
-
----
-
-## 8. The first launch is slow — do not panic
-
-After you enable the module (and again after a WeChat update or reinstall), WeKit's first launch runs a **full DexKit scan** of the WeChat app.
-
-**This takes minutes** — two to three on a Pixel 9 Pro, longer on slower hardware. During that window:
-
-- :3001 does not answer.
-- `curl` gets connection-refused or hangs.
-- Nothing in the UI tells you a scan is in progress.
-
-It looks exactly like a broken install. Wait it out before you start changing things. `adb logcat | grep -i dexkit` if you want to watch.
+这个功能开关**能扛过重启**, 而且只要微信带着模块启动, server 就会自动跟着起来. 对话框里**没有单独的"开机自启"选项** (它只暴露 token 和端口), 所以让这条通道保持在线, 等价于让*微信*一直跑着, 见 §10.
 
 ---
 
-## 9. Find the phone's IP and verify from the agent host
+## 8. 第一次启动很慢, 别慌
 
-Get the phone's WiFi address:
+启用模块之后 (以及每次微信更新或重装之后), WeKit 的第一次启动都会对微信这个 app 跑一次**完整的 DexKit 扫描**.
+
+**这要好几分钟**, Pixel 9 Pro 上是两到三分钟, 更慢的硬件更久. 在这段时间里:
+
+- :3001 不响应.
+- `curl` 会拿到 connection-refused 或者干脆卡住.
+- 界面上没有任何东西告诉你正在扫描.
+
+它看上去跟装坏了一模一样. 先等它过去, 别急着动手改东西. 想盯着看就 `adb logcat | grep -i dexkit`.
+
+---
+
+## 9. 找到手机 IP, 并从 agent 主机上验证
+
+拿到手机的 WiFi 地址:
 
 ```bash
 adb shell ip -4 addr show wlan0        # or Settings → About phone → Status
 ```
 
-Two things worth doing now to keep this address stable, because the transport depends on it:
+现在有两件事值得做, 让这个地址稳定下来, 因为传输层依赖它:
 
-- Give the phone a recognisable device name in Android's settings — the router DNAT script finds it by **DHCP lease name** (`WEKIT_PHONE_HOSTNAME`), not by IP.
-- Add a DHCP reservation for it on your router.
+- 在安卓设置里给手机起一个好认的设备名, 路由器 DNAT 脚本是按 **DHCP 租约名** (`WEKIT_PHONE_HOSTNAME`) 找它的, 不是按 IP.
+- 在路由器上给它加一条 DHCP 静态保留.
 
-On an OpenWrt-family router you can read the lease table directly, which is exactly what the script does:
+在 OpenWrt 系的路由器上可以直接读租约表, 脚本干的就是这件事:
 
 ```sh
 cat /var/dhcp.leases
 ```
 
-Now — **from the machine that runs Hermes**, not from the phone and not from your laptop — verify the API:
+现在, **从跑 Hermes 的那台机器上**验证 API, 不是从手机上, 也不是从你的笔记本上:
 
 ```bash
 curl -sS http://192.168.1.50:3001/api/self/info \
      -H "Authorization: Bearer YOUR_TOKEN"
 ```
 
-A healthy response identifies the logged-in account:
+健康的响应会标明当前登录的账号:
 
 ```json
 {"wxId":"wxid_xxxxxxxx","customWxId":"YourWeChatID"}
 ```
 
-That is exactly the request the plugin makes at startup (it retries a few times before giving up), so if this works, the plugin's `connect()` will too.
+这正是插件启动时发出的那个请求 (它会重试几次才放弃), 所以这条命令能通, 插件的 `connect()` 也能通.
 
-A second useful probe — the contacts list:
+再来一个有用的探测, 通讯录列表:
 
 ```bash
 curl -sS "http://192.168.1.50:3001/api/contacts?type=friends" \
      -H "Authorization: Bearer YOUR_TOKEN"
 ```
 
-Valid `type` values are `all`, `friends`, `groups`, `official_accounts` — plural; `friend` is rejected.
+`type` 的合法取值是 `all`, `friends`, `groups`, `official_accounts`, 都是复数; 写 `friend` 会被拒绝.
 
-**If the agent host and the phone are on different subnets**, this curl times out even though everything on the phone is perfect. That is a routing problem, not a setup problem — see the transport documentation and `wekit-dnat.sh`. If they share a subnet, point `WEKIT_BASE_URL` straight at the phone and skip the script entirely.
+**如果 agent 主机和手机不在同一网段**, 哪怕手机侧一切完美, 这条 curl 也会超时. 那是路由问题, 不是配置问题, 去看传输方式的文档和 `wekit-dnat.sh`. 如果两者同网段, 直接把 `WEKIT_BASE_URL` 指向手机, 那个脚本完全不用装.
 
-> **Whitelist tip — this one has bitten before.** When you set `WEKIT_ALLOWED_USERS`, take the id from the adapter's own log line (`wechat-wekit: inbound from <convId> type=…`) after the person has actually messaged the agent — **not** from the friends list. A contact's entry in your address book is not necessarily the account they message you from, and a mismatched whitelist drops their messages *silently*: the drop is logged at debug level, so at default log level you see nothing at all. Also note **plugin log lines go to Hermes' `agent.log`, not `gateway.log`** — looking in the wrong file makes a working poll loop look dead.
-
----
-
-## 10. Keeping it up
-
-The channel is alive exactly as long as WeChat is running with the module loaded. What helps:
-
-- **Exempt WeChat from battery optimisation / Doze** so the system does not background-kill it.
-- **Keep the phone on power.**
-- **A watchdog on the agent side.** `ops/wechat_watchdog.py` in this repo is the reference implementation: it health-checks over **HTTP**, on the same path the agent uses, every couple of minutes, and only touches adb after several consecutive HTTP failures — at which point it checks whether WeChat is running and launches it with `monkey` if it is not. In the healthy case it makes **zero** adb calls. It **never** force-stops WeChat. Configure it with `WEKIT_BASE_URL` / `WEKIT_TOKEN`, plus `WEKIT_ADB_SERIAL`, `WEKIT_ADB_PATH` and `WEKIT_LOG_PATH` for the adb fallback.
-- **After a phone reboot**, WeChat does not necessarily start on its own. The watchdog launching it is enough, and that whole path has been verified end-to-end: watchdog detects the API down → `monkey` launches WeChat → the module loads → DexKit scans for a few minutes (§8) → the server comes back by itself, because the feature toggle survived the reboot. No manual toggling required.
-
-Do **not** build a watchdog that polls over `adb` on a short interval, and do not put the transport itself on `adb forward`. On the reference host the adb server crashed and respawned every 10–30 seconds entirely on its own — the USB device never dropped — which vaporised the forward roughly every 21 seconds. See the transport docs for the measurements.
+> **白名单提示, 这条真的坑过人.** 配 `WEKIT_ALLOWED_USERS` 的时候, 要等对方真的给 agent 发过消息之后, 从 adapter 自己打的那行日志 (`wechat-wekit: inbound from <convId> type=…`) 里抄 id, **不要**从好友列表里抄. 一个联系人在你通讯录里的那条记录, 未必就是他给你发消息用的那个账号; 而白名单对不上的时候, 消息是被*静默*丢掉的: 丢弃只在 debug 级别记日志, 所以在默认日志级别下你什么都看不到. 另外注意 **插件的日志行进的是 Hermes 的 `agent.log`, 不是 `gateway.log`**, 翻错文件会让一个正常工作的 poll 循环看起来像死了.
 
 ---
 
-## Troubleshooting
+## 10. 让它一直活着
 
-### `curl` gets connection refused / no response on :3001
+这条通道活着的时间, 精确等于微信带着模块在跑的时间. 有帮助的做法:
 
-Work through in this order:
+- **把微信从电池优化 / Doze 里排除掉**, 免得系统在后台把它杀了.
+- **手机一直插着电.**
+- **在 agent 侧放一个 watchdog.** 本仓库的 `ops/wechat_watchdog.py` 就是参考实现: 它每隔几分钟走 **HTTP** 做一次健康检查, 走的是跟 agent 完全相同的那条路径, 只有在连续多次 HTTP 失败之后才会去碰 adb, 到那时它才检查微信是否在跑, 不在就用 `monkey` 把它拉起来. 健康状态下它一次 adb 调用都**不会**发. 它**永远不会**强制停止微信. 用 `WEKIT_BASE_URL` / `WEKIT_TOKEN` 配置它, adb 兜底那条路径另外需要 `WEKIT_ADB_SERIAL`, `WEKIT_ADB_PATH` 和 `WEKIT_LOG_PATH`.
+- **手机重启之后**, 微信不一定会自己起来. 靠 watchdog 把它拉起来就够了, 而且这整条路径已经端到端验证过: watchdog 发现 API 挂了 → `monkey` 拉起微信 → 模块加载 → DexKit 扫描几分钟 (§8) → server 自己回来了, 因为那个功能开关扛过了重启. 全程不需要手动去点任何开关.
 
-1. **Did you just enable the module or update WeChat?** Wait out the DexKit scan (§8).
-2. **Is WeChat running?** `adb shell pidof com.tencent.mm`. No pid = no server.
-3. **Is anything listening?** `adb shell netstat -tln | grep 3001` (add `-p` from a root shell to confirm the socket belongs to `com.tencent.mm`).
-4. **Is the feature toggle still on?** Reopen WeKit's settings inside WeChat.
-5. **Is it the network rather than the phone?** Test from a machine on the *same subnet as the phone*. If that works and the agent host does not, it is routing — go to the transport docs, not back to the phone.
-6. **Did WeChat auto-update?** Check the version. An unsupported build silently disables the hooks (§5).
+**不要**写一个短间隔用 `adb` 轮询的 watchdog, 也不要把传输本身架在 `adb forward` 上. 在参考主机上, adb server 完全自发地每 10 到 30 秒崩溃并重启一次, USB 设备本身一次都没掉过, 结果就是那条 forward 大约每 21 秒蒸发一次. 实测数据见传输方式的文档.
+
+---
+
+## 排障
+
+### `curl` 报 connection refused / :3001 没有响应
+
+按这个顺序排查:
+
+1. **你是不是刚启用模块, 或者刚更新过微信?** 等 DexKit 扫描跑完 (§8).
+2. **微信在跑吗?** `adb shell pidof com.tencent.mm`. 没有 pid 就没有 server.
+3. **有东西在监听吗?** `adb shell netstat -tln | grep 3001` (在 root shell 里加 `-p`, 可以确认这个 socket 属于 `com.tencent.mm`).
+4. **那个功能开关还开着吗?** 回微信里重新打开 WeKit 的设置看一眼.
+5. **问题是出在网络而不是手机上吗?** 从一台跟*手机同网段*的机器上测. 如果那边通而 agent 主机不通, 那就是路由问题, 去看传输方式的文档, 别再回头折腾手机.
+6. **微信是不是自动更新了?** 查版本号. 不受支持的构建会静默让 hook 失效 (§5).
 
 ### HTTP 401
 
-The token in your request does not match the token in WeKit's server settings. Check for a trailing newline or space in whatever you put in `.env`, confirm the header is `Authorization: Bearer YOUR_TOKEN`, and re-read the token in WeKit's dialog on the phone. The plugin reads `WEKIT_TOKEN` at startup, so restart the gateway after changing it.
+你请求里的 token 跟 WeKit server 设置里的 token 不一致. 检查你写进 `.env` 的那个值末尾有没有多出来的换行或空格, 确认请求头是 `Authorization: Bearer YOUR_TOKEN`, 然后回手机上 WeKit 的对话框里重新读一遍 token. 插件是在启动时读 `WEKIT_TOKEN` 的, 所以改完之后要重启 gateway.
 
-### The module is enabled but nothing is hooked
+### 模块已启用, 但什么都没被 hook
 
-`adb logcat -d | grep -iE "vector|xposed|wekit|dexkit"` right after WeChat starts. Empty output means the framework never injected.
+微信刚启动之后立刻跑 `adb logcat -d | grep -iE "vector|xposed|wekit|dexkit"`. 输出为空, 说明框架根本没有注入进去.
 
-| Cause | Fix |
+| 原因 | 修法 |
 |---|---|
-| Zygisk off | Magisk → Settings → Zygisk on → reboot |
-| Framework not active | Open the Vector/LSPosed manager and check its status screen |
-| Module scope does not include WeChat | Manager → Modules → WeKit → tick WeChat → Apply |
-| WeChat not restarted after enabling scope | Close and reopen it (§6, step 4) |
-| WeChat hot-patched itself (tinker) | Causes **silent** non-loading. Disable hot update in WeKit's settings; clearing an already-applied patch means deleting its directory with an on-device file manager |
-| Unsupported WeChat version | Go back to 8.0.72 |
-| You used NPatch instead of root + Xposed | Does not work for WeKit — `libdexkit.so` never loads |
+| Zygisk 没开 | Magisk → Settings → 打开 Zygisk → 重启 |
+| 框架不是 active | 打开 Vector/LSPosed 管理器, 看它的状态页 |
+| 模块作用域里没有微信 | 管理器 → Modules → WeKit → 勾上微信 → Apply |
+| 设完作用域后没有重启微信 | 关掉再打开 (§6 第 4 步) |
+| 微信给自己打了热补丁 (tinker) | 会导致**静默**不加载. 在 WeKit 设置里关掉热更新; 要清掉已经打上的补丁, 得用手机上的文件管理器删掉它的目录 |
+| 微信版本不受支持 | 退回 8.0.72 |
+| 你用的是 NPatch 而不是 root + Xposed | 对 WeKit 不管用, `libdexkit.so` 永远加载不上 |
 
-### 🔴 Never force-stop WeChat
+### 🔴 永远不要强制停止微信
 
-Once WeChat is running with the module injected, **do not force-stop it** — not from Settings → Apps → Force stop, not with `am force-stop com.tencent.mm`, and above all not from any script or watchdog.
+一旦微信带着注入好的模块跑起来, **就不要强制停止它**: 不要走设置 → 应用 → 强行停止, 不要用 `am force-stop com.tencent.mm`, 更重要的是, 不要在任何脚本或 watchdog 里做这件事.
 
-On the reference deployment a force-stop left the Xposed injection in a broken state that only a **full phone reboot** recovered. The port stays closed and nothing in the logs explains why.
+在参考部署里, 一次强制停止就把 Xposed 注入弄成了一个坏掉的状态, 只有**整机重启**才救得回来. 端口一直是关的, 而日志里没有任何东西解释为什么.
 
-The one-time force-close in §6 is how you get the module loaded the first time, on a process that is not yet injected. After that, if you need WeChat restarted, **reboot the phone** and let it come back cleanly. Any automation you write should be able to *launch* WeChat (e.g. `monkey -p com.tencent.mm -c android.intent.category.LAUNCHER 1`) and must never be able to stop it.
+§6 里那一次性的强制关闭, 是为了在一个还没被注入的进程上让模块第一次加载进去. 在那之后, 如果你需要重启微信, 请**重启手机**, 让它干净地起回来. 你写的任何自动化都应该只能*拉起*微信 (例如 `monkey -p com.tencent.mm -c android.intent.category.LAUNCHER 1`), 绝不能具备停止它的能力.
 
-### Root disappeared after a system update
+### 系统更新之后 root 没了
 
-Expected — the OTA overwrote `init_boot`. Re-run §3 with the `init_boot.img` from the *new* build's factory image.
+意料之中, OTA 覆盖了 `init_boot`. 用*新*构建厂包里的 `init_boot.img` 把 §3 重跑一遍.
 
-### `adb shell su` returns `su: request rejected (2000)` instantly
+### `adb shell su` 秒返回 `su: request rejected (2000)`
 
-A stored deny policy for the Shell UID, not SELinux and not a settings problem. Magisk app → **Superuser** tab → enable the **`[SharedUID] Shell`** entry. Changing "Automatic response" does not help, because the stored policy takes precedence.
+这是 Shell UID 上存着一条 deny 策略, 既不是 SELinux 问题, 也不是设置问题. Magisk 应用 → **Superuser** 标签页 → 打开 **`[SharedUID] Shell`** 那一项. 改 "Automatic response" 没用, 因为已存的策略优先级更高.
 
-### Anything involving `/data/adb`
+### 任何牵扯到 `/data/adb` 的操作
 
-SELinux blocks the `su` domain from reading and writing content under `/data/adb`, so `cp` / `chmod` / `cat` there fail with Permission denied. Install modules through the Magisk app or `magisk --install-module` rather than copying files in by hand; the one read-out you do need (the Vector manager APK) is the `setenforce` dance in §4.
+SELinux 禁止 `su` 域读写 `/data/adb` 下的内容, 所以在那里 `cp` / `chmod` / `cat` 都会 Permission denied. 装模块请走 Magisk 应用或者 `magisk --install-module`, 不要手动把文件拷进去; 唯一确实需要读出来的那个文件 (Vector 管理器 APK), 用的就是 §4 里那套 `setenforce` 来回切的办法.
 
 ---
 
-## Done? Check these
+## 做完了? 逐条对一遍
 
-| Check | Expected |
+| 检查项 | 预期 |
 |---|---|
 | `fastboot getvar unlocked` | `yes` |
-| Magisk app | Reports a version, Zygisk on |
-| Framework manager | Framework **active** |
-| `adb logcat -d \| grep -i wekit` after WeChat starts | Module loaded, `libdexkit.so` ok |
-| WeKit settings in WeChat | API+MCP server on, port 3001, **token changed**, hot update disabled, Xposed hidden |
-| `curl …/api/self/info` **from the agent host** | 200 with your `wxId` |
+| Magisk 应用 | 能报出版本号, Zygisk 已开 |
+| 框架管理器 | 框架处于 **active** |
+| 微信启动后跑 `adb logcat -d \| grep -i wekit` | 模块已加载, `libdexkit.so` ok |
+| 微信里的 WeKit 设置 | API+MCP server 已开, 端口 3001, **token 已改**, 热更新已关, Xposed 已隐藏 |
+| **从 agent 主机**跑 `curl …/api/self/info` | 200, 并带上你的 `wxId` |
 
-That last line is the entire phone-side contract this plugin depends on.
+最后那一行, 就是本插件所依赖的全部手机侧契约.
 
-Next: pick a transport (WiFi is strongly recommended over USB — the transport docs have the measured reasons), set `WEKIT_TOKEN` / `WEKIT_BASE_URL` / `WEKIT_ALLOWED_USERS`, and enable the plugin in Hermes.
+下一步: 选一种传输方式 (强烈建议用 WiFi 而不是 USB, 实测理由见传输方式的文档), 配好 `WEKIT_TOKEN` / `WEKIT_BASE_URL` / `WEKIT_ALLOWED_USERS`, 然后在 Hermes 里启用插件.
 
-And before you rely on it for anything, re-read the callout at the top of this page and the architecture notes on **edge-triggered inbound delivery**. Messages that arrive while the poll loop is between `wait-for-new-message` calls are lost permanently, with no cursor to recover them. The plugin mitigates the window by dispatching replies as background tasks so the listener is re-armed immediately — it cannot close it.
+另外, 在你打算依赖它做任何事情之前, 请重读本页开头那段提示, 以及架构文档里关于**边沿触发入站**的那部分. 在 poll 循环两次 `wait-for-new-message` 调用之间到达的消息会永久丢失, 也没有游标能把它们找回来. 插件能做的缓解, 只是把回复作为后台任务派发出去, 好让监听器立刻重新挂上, 它没法把这个窗口关掉.
