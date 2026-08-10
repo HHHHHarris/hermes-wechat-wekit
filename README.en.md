@@ -160,6 +160,7 @@ Then restart the gateway and watch for `wechat-wekit: connected to …`, followe
 | `WEKIT_ALLOWED_LABEL` | No | Name of a WeChat contact label whose members may talk to the agent; merged into `WEKIT_ALLOWED_USERS` at connect time. See [Labels as the allow-list](#labels-as-the-allow-list) |
 | `WEKIT_ALLOW_ALL_USERS` | No | `1` / `true` / `yes` (case-insensitive) disables the whitelist entirely. Unsafe: anyone who can message the account can drive your agent |
 | `WEKIT_ENABLE_WRITE_ACTIONS` | No | `1` / `true` / `yes` allows the action tools that change the account or are seen by others (friend requests, group membership, contact labels, Moments). Off by default |
+| `WEKIT_PLAIN_TEXT` | No | On by default: outbound text is rewritten from markdown into plain prose before sending (see [Outbound text](#outbound-text)). `false` / `0` / `no` / `off` sends it raw |
 | `WEKIT_POLL_TIMEOUT_MS` | No | Long-poll duration in ms. Default `30000`, values below `5000` are clamped up |
 | `WEKIT_HOME_CHANNEL` | No | convId that scheduled/cron deliveries are sent to |
 | `WEKIT_MEDIA_ADB_PATH` | No | Path to `adb`. Setting it turns on retrieval of received files and images off the phone (see below). Unset = disabled |
@@ -257,7 +258,25 @@ Useful facts behind this design: WeKit's API+MCP server toggle **persists across
 | Set / remove group admin | ❌ | WeKit's REST API exposes no endpoint for it (add/remove/invite exist, promotion does not) |
 | Send file / location / sticker as the reply | ❌ | WeKit has endpoints; the reply path is wired for text and image only. Voice and video are reachable through the action tools above |
 
-Replies are sent as plain text — WeChat renders no markdown. The registered `max_message_length` is 2000.
+The registered `max_message_length` is 2000.
+
+## Outbound text
+
+**WeChat has no markdown renderer.** `**important**` from the model reaches the user as those sixteen literal characters, and `### Title` arrives with its hashes. The registered platform hint does say so — write the way a person types in a chat app — but asking is not a guarantee: models are raised on markdown and will leak a `#` eventually. So `send()` carries a deterministic converter behind it (`WEKIT_PLAIN_TEXT`, on by default):
+
+| What the model writes | What the user sees |
+|---|---|
+| `**bold**` / `*italic*` / `__bold__` | bold / italic / bold |
+| `### Deployment result` | Deployment result, hashes gone, a blank line after it |
+| `` `docker restart` `` / ```` ```fenced block``` ```` | the code itself, no backticks and no fences |
+| `- back up first` | `· back up first` — the bullet a Chinese reader expects; `1.` numbering is kept |
+| `[subscription](https://s.starq.me/…)` | subscription https://s.starq.me/… — and just the URL when the label only repeats it |
+| a pipe-drawn table | two columns flatten to `key: value`, wider ones to a short block per row (a monospace grid always shatters on a phone) |
+| `> quote` / `---` / three or more blank lines | the quote's text, the rule dropped, the blank run collapsed to one |
+
+The harder half is **not damaging text that merely looks like markdown**. None of these are touched: the underscores in `wxid_xxxxxxxx`, a path like `/root/.hermes/plugins/wechat_wekit/my_file.py`, `__init__.py`, `2*3` and `2**3`, a line starting `#1`, `C#`, a lone `*` in prose, `rm *.log`, a URL with parentheses (`…/wiki/Foo_(bar)#history`), and prose that merely happens to contain pipes with no delimiter row. Every rule bails out when unsure: a stray asterisk on screen is only ugly, while a damaged wxid is wrong in a way the reader cannot detect.
+
+The converter never raises. A bug in it may at worst ship the markdown; it can never cost the message.
 
 ## Action tools
 
