@@ -144,6 +144,31 @@ _MEDIA_KIND_TO_TYPE = {
 }
 
 
+def _describe_exc(e: BaseException, depth: int = 0) -> str:
+    """把异常描述成一行, 空 str() 也能看出是什么.
+
+    `str(e)` 对不少异常是空的, 直接记进日志就是一行没有内容的告警. 这里始终带上
+    类型名, 必要时补 repr, 并且递归展开 ExceptionGroup 和 __cause__ —— 否则
+    "unhandled errors in a TaskGroup" 这种壳子会把真正的原因整个盖住.
+
+    One-line description of an exception that stays useful when str() is empty.
+    Always carries the type name, falls back to repr, and unwraps ExceptionGroup
+    and __cause__, so a wrapper like "unhandled errors in a TaskGroup" cannot
+    hide the real reason.
+    """
+    if depth > 4:
+        return type(e).__name__
+    text = str(e).strip()
+    out = f"{type(e).__name__}: {text}" if text else f"{type(e).__name__}({e!r})"
+    subs = getattr(e, "exceptions", None)
+    if subs:
+        inner = "; ".join(_describe_exc(x, depth + 1) for x in list(subs)[:3])
+        return f"{out} -> [{inner}]"
+    if e.__cause__ is not None:
+        return f"{out} <- {_describe_exc(e.__cause__, depth + 1)}"
+    return out
+
+
 def _type_name(t: int) -> str:
     return _TYPE_NAMES.get(t, f"type{t}")
 
@@ -1828,7 +1853,19 @@ class WeKitAdapter(BasePlatformAdapter):
                 break
             except Exception as e:
                 self._mcp_sid = None
-                logger.warning("wechat-wekit: poll error: %s", e)
+                # 用 _describe_exc 而不是直接打 e: 很多异常 str() 是空的
+                # (httpx.ReadError、无消息的 ExceptionGroup 都是), 于是日志里
+                # 只剩 "poll error: " 后面什么都没有 —— 报了错却什么也没说,
+                # 而每次 poll error 都意味着监听器被拆掉重连, 那段时间的消息
+                # 是永久丢失的(入站边沿触发), 所以这里必须留下能查的东西.
+                #
+                # Use _describe_exc rather than logging e directly: plenty of
+                # exceptions stringify to nothing (httpx.ReadError, a message-less
+                # ExceptionGroup), leaving "poll error: " and no diagnosis at all.
+                # Every poll error tears the listener down and reconnects, and
+                # inbound is edge-triggered, so messages in that window are lost
+                # for good. It has to leave something to go on.
+                logger.warning("wechat-wekit: poll error: %s", _describe_exc(e))
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 30.0)
         logger.info("wechat-wekit: inbound poll loop stopped")

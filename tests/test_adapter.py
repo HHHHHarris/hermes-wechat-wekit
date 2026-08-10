@@ -498,3 +498,50 @@ def test_attach_note_names_each_media_kind():
         note = _attach_note("[x] placeholder", kind, "/tmp/x")
         assert noun in note.lower()
         assert "/tmp/x" in note
+
+
+# ── 异常描述 / describing exceptions ──────────────────────────────────────
+#
+# 线上出现过 12 条 "poll error: " 后面完全空白的告警: `str(e)` 是空的, 而每一条
+# 都意味着监听器被拆掉重连、那段时间的入站消息永久丢失。报了错却说不出是什么,
+# 等于没报。
+#
+# Production logged 12 warnings reading "poll error: " and nothing else, because
+# str(e) was empty — while each one means the listener was torn down and inbound
+# messages in that window were lost for good. An error that says nothing is not
+# an error report.
+
+def test_an_exception_with_an_empty_message_still_names_its_type():
+    got = wk._describe_exc(ValueError(""))
+    assert "ValueError" in got
+    assert got.strip() != "ValueError:"
+
+
+def test_a_normal_exception_keeps_its_message():
+    assert wk._describe_exc(ValueError("boom")) == "ValueError: boom"
+
+
+def test_the_cause_is_unwrapped():
+    try:
+        raise RuntimeError("outer") from KeyError("inner")
+    except RuntimeError as e:
+        got = wk._describe_exc(e)
+    assert "RuntimeError" in got and "KeyError" in got
+
+
+def test_a_group_shows_its_members_not_just_the_wrapper():
+    # 这正是 MCP 那边 "unhandled errors in a TaskGroup" 什么也说明不了的原因.
+    # This is why "unhandled errors in a TaskGroup" explained nothing.
+    class FakeGroup(Exception):
+        exceptions = (ValueError("a"), TypeError("b"))
+
+    got = wk._describe_exc(FakeGroup("grp"))
+    assert "ValueError" in got and "TypeError" in got
+
+
+def test_describe_exc_terminates_on_a_self_referencing_chain():
+    # 自引用的异常链不能把日志打挂 —— 这里必须收敛.
+    # A self-referencing chain must not hang the logger.
+    e = ValueError("loop")
+    e.__cause__ = e
+    assert "ValueError" in wk._describe_exc(e)
